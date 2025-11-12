@@ -1,0 +1,1 @@
+Been a fan of F1, applying my tech knowledge to extract insights and make my watch much interesting
