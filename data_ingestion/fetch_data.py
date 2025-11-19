@@ -74,12 +74,78 @@ def save_session(session, year, grand_prix, session_type):
     except Exception as e:
         print(f"error saving session data: {e}")
         return None
+
+
+def batch_fetch_sessions(session_list):
+    results = { 
+        'successful': [],
+        'failed': []
+    }
+    for year, grand_prix, session_type in session_list:
+        print(f"\n Fetching {year} {grandprix} {session_type}")
+
+        session = get_session_data(year, grand_prix, session_type)
+
+        if session is not None:
+            save_path = save_session_data(session, year, grand_prix, session_type)
+                if save_path:
+                    results['successful'].append((year, grand_prix, session_type))
+        else:
+            results['failed'].append((year, grand_prix, session_type))
+
+        print("Batch Fetch Summary")
+        print(f"Successful: {len(results['successful'])}")
+        for item in results['successful']:
+            print(f" - {item}")
+        print(f" Failed: {len(results['failed'])}")
+        for item in results['failed']:
+            print(f" - {item}")
+        
+        return results
+
+def load_session_from_disk(year, grand_prix, session_type):
+    event_dir = os.path.join(RAW_DATA_DIR, f"{year}_{grand_prix}_{session_type}")
+
+    if not os.path.exists(event_dir):
+        print(f" Data not found for {year} {grand_prix} {session_type}")
+        return None, None
+    
+    try:
+        laps_file = os.path.join(event_dir, 'laps.parquet')
+        laps_df = pd.read_parquet(laps_file)
+
+        metadata_file = os.path.join(event_dir, 'metadata.json')
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        
+        print(f"Loaded {year} {grand_prix} {session_type} from disk")
+        orint(f" - Rows: {len(laps_df)}")
+        print(f" - Columns: {len(laps_df.columns)}")
+
+        return laps_df, metadata
+    except Exception as e:
+        print(f'Error loading data: {e}')
+        return None, None
+
+
+
+
     
 if __name__ == '__main__':
-    session = get_session_data(2024, 'Brazil', 'R')
 
-    if session:
-        print("\nSession Info:")
-        print(f"Event: {session.event['EventName']}")
-        print(f"Date: {session.date}")
-        print(f"Weather: {session.weather_data.head() if hasattr(session, 'weather_data') else 'N/A'}")
+    sessions_to_fetch = [
+        (2024, 'Brazil', 'R'),
+        (2024, 'Belgium', 'R'),
+        (2024, 'Australia', 'R')
+    ]
+
+    results = batch_fetch_sessions(sessions_to_fetch)
+
+    print('Testing disk Load')
+    laps_df, metadata = load_session_from_disk(2024, 'Brazil', 'R')
+
+    if laps_df is not None:
+        print(f"\n Laps Dataframe Info:")
+        print(f"Shape: {laps_df.shape}")
+        print(f"\n First few rows:")
+        print(laps_df.head())
