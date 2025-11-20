@@ -5,8 +5,8 @@ import json
 from datetime import datetime
 import os
 
-CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", 'data', 'cache')
-RAW_DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
+CACHE_DIR = os.path.join("D:/Projects/F1ALY", 'data', 'cache')
+RAW_DATA_DIR = os.path.join("D:/Projects/F1ALY", 'data', 'raw')
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok = True)
@@ -29,6 +29,11 @@ def get_session_data(year, grand_prix, session_type):
     
 def save_session(session, year, grand_prix, session_type):
 
+    if session.laps.empty:
+        print("No laps data for this session.")
+        return None
+
+
     if session is None:
         print('Session is None, cannot save')
         return
@@ -43,13 +48,21 @@ def save_session(session, year, grand_prix, session_type):
         telemetry_dir = os.path.join(event_dir, 'telemetry')
         os.makedirs(telemetry_dir, exist_ok=True)
 
-        drivers = session.laps['Drivers'].nunique()
+        #drivers = session.laps['Drivers'].nunique()
+        drivers = session.laps['Driver'].dropna().unique()
+
         for driver in drivers:
             try:
+                
+                if session.laps[session.laps['Driver'] == driver].empty:
+                    print(f"No lap data for driver {driver}, skipping telemetry save.")
+                    continue
+
                 driver_telemetry = session.laps[session.laps['Driver']==driver].get_telemetry().reset_index(drop=True)
                 if len(driver_telemetry) > 0:
                     telemetry_file = os.path.join(telemetry_dir, f"{driver}_telemetry.parquet")
                     driver_telemetry.to_parquet(telemetry_file)
+
             except Exception as e:
                 print(f'Couldnot save telemetry for {driver}: {e}')
         
@@ -82,14 +95,14 @@ def batch_fetch_sessions(session_list):
         'failed': []
     }
     for year, grand_prix, session_type in session_list:
-        print(f"\n Fetching {year} {grandprix} {session_type}")
+        print(f"\n Fetching {year} {grand_prix} {session_type}")
 
         session = get_session_data(year, grand_prix, session_type)
 
         if session is not None:
-            save_path = save_session_data(session, year, grand_prix, session_type)
-                if save_path:
-                    results['successful'].append((year, grand_prix, session_type))
+            save_path = save_session(session, year, grand_prix, session_type)
+            if save_path:
+                results['successful'].append((year, grand_prix, session_type))
         else:
             results['failed'].append((year, grand_prix, session_type))
 
@@ -119,7 +132,7 @@ def load_session_from_disk(year, grand_prix, session_type):
             metadata = json.load(f)
         
         print(f"Loaded {year} {grand_prix} {session_type} from disk")
-        orint(f" - Rows: {len(laps_df)}")
+        print(f" - Rows: {len(laps_df)}")
         print(f" - Columns: {len(laps_df.columns)}")
 
         return laps_df, metadata

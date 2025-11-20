@@ -35,10 +35,10 @@ def validate_session_data(laps_df, metadata):
             }
 
             print('Data Validation Report')
-            print(f'Status: {report['status']}')
-            print(f'Total Rows: {report['summary']['total_rows']}')
-            print(f'Unique Drivers: {report['summary']['unique_drivers']}')
-            print(f'Lap Range: {report['summary']['lap_range']}')
+            print(f"Status: {report['status']}")
+            print(f"Total Rows: {report['summary']['total_rows']}")
+            print(f"Unique Drivers: {report['summary']['unique_drivers']}")
+            print(f"Lap Range: {report['summary']['lap_range']}")
 
             if report['warnings']:
                 print('Warnings')
