@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
+D:/Projects/F1ALY/data/cache
+data/cache
+D:/Projects/F1ALY/data/raw
+data/raw
+
 # C extensions
 *.so
 
