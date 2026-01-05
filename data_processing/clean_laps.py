@@ -64,23 +64,31 @@ def driver_summary(race_pace_df):
 
 
 
-
-
-
 if __name__ == '__main__':
     from data_ingestion.fetch_data import load_session_from_disk
     import os
 
-    laps_df, metadata = load_session_from_disk(2024, 'Brazil', 'R')
-    race_pace_df = build_race_pace(laps_df)
-    pit_df = build_pit_strategy(laps_df)
-    driver_sum = driver_summary(race_pace_df)
+    races = [
+        "Belgian Grand Prix",
+        "Australian Grand Prix",
+        "Saudi Arabian Grand Prix",
+        "Bahrain Grand Prix"
+    ]
 
-    os.makedirs('D:/Projects/F1ALY/data/processed', exist_ok=True)
+    year = 2024
 
-    race_pace_df.to_parquet('D:/Projects/F1ALY/data/processed/2024_Brazil_race.parquet')
-    pit_df.to_parquet('D:/Projects/F1ALY/data/processed/2024_Brazil_pit.parquet')
+    os.makedirs('D:/Projects/F1ALY/data/processed/', exist_ok=True)
 
-    driver_sum.to_parquet('D:/Projects/F1ALY/data/processed/2024_Brazil_driver_summary.parquet')
+    for gp in races:
+        print(f'Processing {year} {gp} R')
+        laps_df, metadata = load_session_from_disk(year,gp,"R")
+        if laps_df in None:
+            continue
+        race_pace_df = build_race_pace(laps_df)
+        pit_df = build_pit_strategy(laps_df)
+        driver_sum = driver_summary(race_pace_df)
 
-    
+        race_pace_df.to_parquet(f"D:/Projects/F1ALY/data/processed/{year}_{gp}_race_pace.parquet")
+        pit_df.to_parquet(f"D:/Projects/F1ALY/data/processed/{year}_{gp}_pit.parquet")
+driver_sum.to_parquet(f"D:/Projects/F1ALY/data/processed/{year}_{gp}_driver_summary.parquet")
+

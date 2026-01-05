@@ -4,9 +4,9 @@ __pycache__/
 *$py.class
 
 
-D:/Projects/F1ALY/data/cache
 data/cache
 D:/Projects/F1ALY/data/raw
+data
 data/raw
 
 # C extensions
