@@ -78,26 +78,52 @@ def complete_feature_set(race_pace_df, pit_df, driver_summary_df):
 
     return df_features
 
+RACES_2024 = ["Belgian Grand Prix", "Australian Grand Prix", 'Saudi Arabian Grand Prix', 'Bahrain Grand Prix']
+
+
+def build_multi_race_feature_set(year=2024, races=None):
+    if races is None:
+        races = RACES_2024
+    
+    all_features = []
+
+    for gp in races:
+        print(f' Feature engineering for {year} {gp} R')
+        from data_ingestion.fetch_data import load_session_from_disk
+        from data_processing.clean_laps import (build_race_pace, 
+                                                build_pit_strategy, 
+                                                driver_summary,)
+
+        laps_df, metadata = load_session_from_disk(year, gp, "R")
+
+        if laps_df is None:
+            continue
+
+        race_pace_df = build_race_pace(laps_df)
+        pit_df = build_pit_strategy(laps_df)
+        driver_summary_df = driver_summary(race_pace_df)
+
+        df_features = complete_feature_set(race_pace_df, pit_df, driver_summary_df)
+        df_features['GrandPrix'] = gp
+        df_features['Year'] = year
+
+        all_features.append(df_features)
+    
+    combined = pd.concat(all_features, ignore_index = True)
+    print(f'Combined feature set shape: {combined.shape}')
+    return combined
+
 
 if __name__ == '__main__':
-    from data_processing.clean_laps import build_race_pace, build_pit_strategy, driver_summary
-    from data_ingestion.fetch_data import load_session_from_disk
-
-    laps_df, metadata = load_session_from_disk(2024, 'Brazil', 'R')
-
-    race_pace_df = build_race_pace(laps_df)
-    pit_df = build_pit_strategy(laps_df)
-    driver_summary_df = driver_summary(race_pace_df)
-
-    features_df = complete_feature_set(race_pace_df, pit_df, driver_summary_df)
-
     import os
     os.makedirs('D:/Projects/F1ALY/modeling', exist_ok=True)
 
-    features_df.to_parquet('d:/Projects/F1ALY/modeling/2024_Brazil_features.parquet')
+    combined_features = build_multi_race_feature_set(year = 2024)
+    combined_features.to_parquet('D:/Projects/F1ALY/modeling/2024_multi_race_features.parquet')
 
-    print(f"Saved features:::")
-    print(f"\nFirst few rows: \n{features_df.head()}")
-    print(features_df.columns)
+    print('\nSample combined data: ')
+    print(combined_features.head())
+
+
 
 
