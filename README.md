@@ -11,7 +11,6 @@ Understand which factors most strongly influence race lap times and tire perform
 - Validate the business value of proactive tire management and pit stop timing
 
 
-
 ## Project Structure
 
 - `/data_ingestion`: Scripts and notebooks for fetching, caching, and validating raw F1 data.
@@ -123,4 +122,5 @@ The model identified the following factors as most influential in determining la
 - `modeling/plots/feature_importance.png`: Feature importance visualization
 
 
-## Phase B: Ongoing and will be updated soon ...
+## Phase B: Ongoing and will be updated soon ..
+More in progress
