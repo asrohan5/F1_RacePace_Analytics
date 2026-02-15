@@ -2,19 +2,77 @@
 
 Been a fan of F1, applying my tech knowledge to extract insights and make my watch much interesting
 
-## Phase A: Brazil 2024 Grand Prix Analysis
-
 ### Objective
 This project implements a production-grade data pipeline to answer "What drives lap times in F1 races, and how can teams use these insights for better strategy decisions?" using real 2024 race data from FastF1. 
-
-Understand which factors most strongly influence race lap times and tire performance using data-driven modeling. Specifically, I aimed to:
-- Quantify the impact of tire age, race progression, and driver consistency on lap time
-- Build an interpretable predictive model to support strategic decision-making
-- Validate the business value of proactive tire management and pit stop timing
 
 
 Phase A focuses on a single race (Brazil GP). Phase B extends to multi-race generalization (4 GPs).
 
+
+## Phase B: SMART Goal Definition (Phase A is provided after this)
+
+### SMART Goal
+**By February 28, 2026, develop and validate a cross-circuit lap time prediction model that generalizes across 4 distinct 2024 F1 Grand Prix races (Bahrain, Saudi Arabian, Australian, Belgian), achieving a test MAE ≤ 0.75 seconds on a held-out circuit while maintaining ≥85% R², using the same 5 core features from Phase A (LapTimeDelta, TireAge, RaceProgress%, ConsistencyScore, Compound_Encoded).** 
+
+**Specific:** Multi-race generalization of Phase A Random Forest model.  
+**Measurable:** MAE ≤ 0.75s, R² ≥ 0.85 on held-out test circuit.  
+**Achievable:** Reuses existing pipeline + 3 additional races (already ingested).  
+**Relevant:** Tests real-world model deployment across track conditions.  
+**Time-bound:** Complete by Feb 28, 2026 (2 weeks).
+
+***
+
+## Primary Objectives
+
+1. **Validate Phase A model generalization**  
+   Train Phase A Random Forest on 3 races, test on 1 held-out race (Belgian GP).  
+   **Success:** MAE ≤ 0.75s (vs Phase A single-race MAE 0.63s).
+
+2. **Benchmark model families**  
+   Compare Linear Regression (baseline), Random Forest, XGBoost.  
+   **Success:** RF/XGBoost outperform Linear by ≥10% R².
+
+3. **Quantify circuit effects**  
+   Measure feature importance stability across tracks.  
+   **Success:** Top 3 features (LapTimeDelta, TireAge, RaceProgress%) rank consistently.
+
+***
+
+## Secondary Objectives
+
+1. **Circuit-specific insights**  
+   Compare feature importances: Does TireAge matter more on high-degradation tracks?  
+   
+2. **Strategy benchmarking**  
+   Compare model predictions vs actual lap times for top/mid-field drivers.
+
+3. **Model diagnostics**  
+   Residual analysis: Identify prediction failure modes by circuit/driver.
+
+***
+
+## KPIs & Success Metrics
+
+| **Metric**       | **Phase A (Brazil)**     | **Phase B Target**         | **Rationale** 
+|------------      |---------------------     |--------------------        |-------------- 
+| Test MAE         | 0.63s                    | ≤ 0.75s                    | Slight degradation acceptable for generalization 
+| Test R²          | 0.91                     | ≥ 0.85                     | 85% explained variance across circuits 
+| Feature Stability| N/A                      | Top 3 features consistent  | Model learns generalizable patterns 
+| Train/Test Gap   | N/A                      | ≤ 0.15 MAE                 | Minimal overfitting 
+| Circuits Covered | 1                        | 4                          | Bahrain (street), Saudi (street), Australia (street), Belgium (traditional) 
+
+
+
+## Why This Goal is Valuable for Recruiters
+
+1. **Production ML mindset:** Cross-validation, generalization testing, multi-model comparison.
+2. **Business relevance:** Circuit-agnostic strategy insights for teams.
+3. **Technical depth:** End-to-end from raw data → deployable model.
+4. **Quantifiable success:** Clear KPIs with realistic targets.
+5. **Scalable design:** Pipeline ready for 24-race season.
+
+
+## Phase A: Brazil 2024 Grand Prix Analysis
 ## Technical Architecture
 
 The pipeline follows this flow:
