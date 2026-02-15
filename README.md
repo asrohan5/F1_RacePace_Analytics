@@ -63,13 +63,6 @@ Phase A focuses on a single race (Brazil GP). Phase B extends to multi-race gene
 
 
 
-## Why This Goal is Valuable for Recruiters
-
-1. **Production ML mindset:** Cross-validation, generalization testing, multi-model comparison.
-2. **Business relevance:** Circuit-agnostic strategy insights for teams.
-3. **Technical depth:** End-to-end from raw data → deployable model.
-4. **Quantifiable success:** Clear KPIs with realistic targets.
-5. **Scalable design:** Pipeline ready for 24-race season.
 
 
 ## Phase A: Brazil 2024 Grand Prix Analysis
