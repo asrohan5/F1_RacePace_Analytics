@@ -138,7 +138,7 @@ INITIAL_MODEL_PARAMS = {
 # BEST PARAMS  (empty — auto-populated by model_trainer.py after GridSearch)
 # ─────────────────────────────────────────
 BEST_CLASSIFIER_PARAMS = {}
-BEST_REGRESSOR_PARAMS  = {}
+BEST_REGRESSOR_PARAMS = {'n_estimators': 50, 'min_samples_leaf': 2, 'max_features': 0.5, 'max_depth': 5}
 
 
 if __name__ == "__main__":

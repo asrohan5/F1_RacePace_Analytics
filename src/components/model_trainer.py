@@ -1,6 +1,5 @@
 import os
 import sys
-import logging
 import pandas as pd
 import numpy as np
 import pickle
@@ -16,16 +15,15 @@ from sklearn.metrics import (
 )
 from xgboost import XGBRegressor, XGBClassifier
 
-import logger
-from exception import CustomException
-from config import (
+from src.logger import logging as log
+from src.exception import CustomException
+from src.config import (
     TRAIN_PATH, VAL_PATH,
     CLASSIFIER_PATH, REGRESSOR_PATH,
     TARGET_REGRESSION, TARGET_CLASSIFICATION,
     INITIAL_MODEL_PARAMS
 )
 
-log = logging.getLogger(__name__)
 
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
@@ -90,8 +88,7 @@ def update_config_best_params(best_reg_params, best_clf_params):
     This way config.py is always the single source of truth.
     """
     try:
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "..", "..", "config.py")
+        config_path = os.path.join(os.getcwd(), "src", "config.py")
         config_path = os.path.normpath(config_path)
 
         with open(config_path, "r") as f:
@@ -167,7 +164,7 @@ def train_regressors(X_train, y_train, X_val, y_val):
             RandomForestRegressor(random_state=42),
             rf_param_grid, n_iter=20, cv=5,
             scoring="neg_mean_absolute_error",
-            random_state=42, n_jobs=-1
+            random_state=42, n_jobs=1
         )
         rf_search.fit(X_train, y_train)
         best_rf = rf_search.best_estimator_
@@ -189,7 +186,7 @@ def train_regressors(X_train, y_train, X_val, y_val):
             XGBRegressor(random_state=42, verbosity=0),
             xgb_param_grid, n_iter=20, cv=5,
             scoring="neg_mean_absolute_error",
-            random_state=42, n_jobs=-1
+            random_state=42, n_jobs=1
         )
         xgb_search.fit(X_train, y_train)
         best_xgb = xgb_search.best_estimator_
@@ -263,7 +260,7 @@ def train_classifiers(X_train, y_train, X_val, y_val):
         rf_search = RandomizedSearchCV(
             RandomForestClassifier(class_weight="balanced", random_state=42),
             rf_param_grid, n_iter=20, cv=5,
-            scoring="f1", random_state=42, n_jobs=-1
+            scoring="f1", random_state=42, n_jobs=1
         )
         rf_search.fit(X_train, y_train)
         best_rf = rf_search.best_estimator_
@@ -288,7 +285,7 @@ def train_classifiers(X_train, y_train, X_val, y_val):
                           random_state=42, verbosity=0,
                           eval_metric="logloss"),
             xgb_param_grid, n_iter=20, cv=5,
-            scoring="f1", random_state=42, n_jobs=-1
+            scoring="f1", random_state=42, n_jobs=1
         )
         xgb_search.fit(X_train, y_train)
         best_xgb = xgb_search.best_estimator_
