@@ -114,10 +114,26 @@ TARGET_REGRESSION      = "lap_time_delta_sec"  # VER LapTime - HAM LapTime per l
 TARGET_CLASSIFICATION  = "ver_faster"           # 1 if VER faster than HAM on that lap, 0 otherwise
 
 # ─────────────────────────────────────────
-# HYPERPARAMETERS  (empty — populated after EDA)
+# HYPERPARAMETERS  (After EDA)
 # ─────────────────────────────────────────
-INITIAL_MODEL_PARAMS = {}
 
+INITIAL_MODEL_PARAMS = {
+    # Regression: predicting lap time delta (continuous, std ~0.978s)
+    # Starting with RandomForest as baseline — robust to scale, no normality assumption
+    "regressor": {
+        "n_estimators": 100,
+        "max_depth": 5,           # shallow — we have ~142 paired laps, avoid overfit
+        "min_samples_leaf": 5,
+        "random_state": 42
+    },
+    # Classifier: predicting VER_Faster (binary, balanced 47/53)
+    # Starting with LogisticRegression as baseline — interpretable, good for small data
+    "classifier": {
+        "C": 1.0,
+        "max_iter": 1000,
+        "random_state": 42
+    }
+}
 # ─────────────────────────────────────────
 # BEST PARAMS  (empty — auto-populated by model_trainer.py after GridSearch)
 # ─────────────────────────────────────────
