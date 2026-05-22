@@ -8,6 +8,7 @@ data/cache
 D:/Projects/F1ALY/data/raw
 data
 data/raw
+cache
 
 # C extensions
 *.so
