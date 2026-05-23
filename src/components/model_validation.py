@@ -23,7 +23,7 @@ from src.config import (
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
-    "brake_zone_count_delta", "tyre_life_delta",
+    "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
@@ -33,7 +33,6 @@ FEATURE_COLS = [
     "same_compound", "VER_compound_enc", "HAM_compound_enc",
     "LapNumber", "race_enc"
 ]
-
 
 # ─────────────────────────────────────────
 # LOAD DATA AND MODELS

@@ -17,7 +17,10 @@ from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
     TRAIN_PATH, VAL_PATH, TEST_PATH,
+    TRAIN_SC_PATH, VAL_SC_PATH, TEST_SC_PATH,
     REGRESSOR_PATH, CLASSIFIER_PATH,
+    REGRESSOR_SC_PATH, CLASSIFIER_SC_PATH,
+    FEATURES_PATH, FEATURES_SAME_COMPOUND_PATH,
     ARTIFACTS_DIR,
     TARGET_REGRESSION, TARGET_CLASSIFICATION
 )
@@ -26,7 +29,7 @@ from src.config import (
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
-    "brake_zone_count_delta", "tyre_life_delta",
+    "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
@@ -37,19 +40,18 @@ FEATURE_COLS = [
     "LapNumber", "race_enc"
 ]
 
-# Human-readable feature labels for plots
 FEATURE_LABELS = [
-    "Coasting % Delta",        "Full Throttle % Delta",   "Gear Shifts Delta",
-    "Brake Zone Length Delta",  "Entry Speed Delta",       "Brake Zone Count Delta",
-    "Tyre Life Delta",
-    "VER Coasting %",          "HAM Coasting %",
-    "VER Full Throttle %",     "HAM Full Throttle %",
-    "VER Gear Shifts",         "HAM Gear Shifts",
-    "VER Brake Zone Length",   "HAM Brake Zone Length",
-    "VER Entry Speed",         "HAM Entry Speed",
-    "VER Tyre Life",           "HAM Tyre Life",
-    "Same Compound",           "VER Compound",            "HAM Compound",
-    "Lap Number",              "Race"
+    "Coasting % Delta",         "Full Throttle % Delta",   "Gear Shifts Delta",
+    "Brake Zone Length Delta",  "Entry Speed Delta",        "Brake Zone Count Delta",
+    "Tyre Life Delta",          "TyreLife x Coasting Delta",
+    "VER Coasting %",           "HAM Coasting %",
+    "VER Full Throttle %",      "HAM Full Throttle %",
+    "VER Gear Shifts",          "HAM Gear Shifts",
+    "VER Brake Zone Length",    "HAM Brake Zone Length",
+    "VER Entry Speed",          "HAM Entry Speed",
+    "VER Tyre Life",            "HAM Tyre Life",
+    "Same Compound",            "VER Compound",            "HAM Compound",
+    "Lap Number",               "Race"
 ]
 
 
@@ -66,19 +68,26 @@ def save_fig(fig, filename):
 
 def load_all():
     try:
-        train = pd.read_csv(TRAIN_PATH)
-        val   = pd.read_csv(VAL_PATH)
-        test  = pd.read_csv(TEST_PATH)
+        train    = pd.read_csv(TRAIN_PATH)
+        val      = pd.read_csv(VAL_PATH)
+        test     = pd.read_csv(TEST_PATH)
+        train_sc = pd.read_csv(TRAIN_SC_PATH)
+        val_sc   = pd.read_csv(VAL_SC_PATH)
+        test_sc  = pd.read_csv(TEST_SC_PATH)
 
-        with open(REGRESSOR_PATH,  "rb") as f:
-            reg = pickle.load(f)
-        with open(CLASSIFIER_PATH, "rb") as f:
-            clf = pickle.load(f)
+        with open(REGRESSOR_PATH,     "rb") as f: reg    = pickle.load(f)
+        with open(CLASSIFIER_PATH,    "rb") as f: clf    = pickle.load(f)
+        with open(REGRESSOR_SC_PATH,  "rb") as f: reg_sc = pickle.load(f)
+        with open(CLASSIFIER_SC_PATH, "rb") as f: clf_sc = pickle.load(f)
 
-        log.info(f"Train={train.shape} | Val={val.shape} | Test={test.shape}")
-        log.info(f"Regressor : {type(reg).__name__}")
-        log.info(f"Classifier: {type(clf).__name__}")
-        return train, val, test, reg, clf
+        log.info(f"Full  — Train={train.shape} Val={val.shape} Test={test.shape}")
+        log.info(f"SC    — Train={train_sc.shape} Val={val_sc.shape} Test={test_sc.shape}")
+        log.info(f"Regressor     : {type(reg).__name__}")
+        log.info(f"Classifier    : {type(clf).__name__}")
+        log.info(f"SC Regressor  : {type(reg_sc).__name__}")
+        log.info(f"SC Classifier : {type(clf_sc).__name__}")
+
+        return train, val, test, train_sc, val_sc, test_sc, reg, clf, reg_sc, clf_sc
     except Exception as e:
         raise CustomException(e, sys)
 
@@ -321,6 +330,71 @@ def plot_shap_classifier(clf, X_train, X_val):
     except Exception as e:
         raise CustomException(e, sys)
 
+def plot_shap_regression_sc(reg_sc, X_train_sc, X_val_sc):
+    try:
+        log.info("Computing SHAP values for SC regressor (LinearRegression)...")
+
+        explainer   = shap.LinearExplainer(reg_sc, X_train_sc,
+                                            feature_perturbation="interventional")
+        shap_values = explainer.shap_values(X_val_sc)
+
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+        fig.suptitle("SHAP Feature Importance — Same-Compound Laps\n"
+                     "(Driving Style Isolated, LinearRegression)",
+                     fontsize=13)
+
+        # Bar chart
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        sorted_idx    = np.argsort(mean_abs_shap)
+        colors        = ["#B45309" if i >= len(sorted_idx) - 5
+                         else "#FCD34D" for i in range(len(sorted_idx))]
+
+        axes[0].barh(
+            [FEATURE_LABELS[i] for i in sorted_idx],
+            mean_abs_shap[sorted_idx],
+            color=colors
+        )
+        axes[0].set_xlabel("Mean |SHAP Value| (seconds impact on lap delta)")
+        axes[0].set_title("Feature Importance — SC Model")
+        axes[0].grid(True, alpha=0.3, axis="x")
+
+        # Side-by-side comparison with full model SHAP
+        # Compute full model SHAP for comparison
+        full_explainer   = shap.TreeExplainer(
+            pickle.loads(open(REGRESSOR_PATH, "rb").read())
+        )
+        full_shap_vals   = full_explainer.shap_values(X_val_sc)
+        full_mean_abs    = np.abs(full_shap_vals).mean(axis=0)
+
+        x      = np.arange(len(FEATURE_LABELS))
+        width  = 0.35
+        axes[1].barh(x - width/2, full_mean_abs,  width,
+                     label="Full Dataset (XGBoost)",    color="#1E3A8A", alpha=0.7)
+        axes[1].barh(x + width/2, mean_abs_shap,  width,
+                     label="Same Compound (LinearReg)", color="#B45309", alpha=0.7)
+        axes[1].set_yticks(x)
+        axes[1].set_yticklabels(FEATURE_LABELS, fontsize=8)
+        axes[1].set_xlabel("Mean |SHAP Value|")
+        axes[1].set_title("Full vs SC — Feature Importance Shift")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3, axis="x")
+
+        plt.tight_layout()
+        save_fig(fig, "13_shap_comparison_full_vs_sc.png")
+
+        log.info("  Top 5 SC features by SHAP impact:")
+        top5 = np.argsort(mean_abs_shap)[::-1][:5]
+        for rank, i in enumerate(top5, 1):
+            log.info(f"    {rank}. {FEATURE_LABELS[i]:<35} "
+                     f"mean |SHAP| = {mean_abs_shap[i]:.4f}s")
+
+        return shap_values
+
+    except Exception as e:
+        raise CustomException(e, sys)
+    
+
+
 
 # ─────────────────────────────────────────
 # PLOT 6 — DRIVER STYLE FINGERPRINT
@@ -492,6 +566,90 @@ def evaluate_test_set(reg, clf, X_test, y_test_reg, y_test_clf, test_df):
     except Exception as e:
         raise CustomException(e, sys)
 
+def evaluate_test_set_sc(reg_sc, clf_sc, X_test_sc,
+                          y_test_sc_reg, y_test_sc_clf, test_sc_df):
+    try:
+        log.info("=" * 60)
+        log.info("SC TEST SET EVALUATION — Same-compound holdout")
+        log.info("=" * 60)
+
+        from sklearn.metrics import (mean_absolute_error, mean_squared_error,
+                                     r2_score, accuracy_score,
+                                     f1_score, roc_auc_score)
+
+        reg_pred  = reg_sc.predict(X_test_sc)
+        test_mae  = mean_absolute_error(y_test_sc_reg, reg_pred)
+        test_rmse = mean_squared_error(y_test_sc_reg,  reg_pred) ** 0.5
+        test_r2   = r2_score(y_test_sc_reg, reg_pred)
+
+        clf_pred  = clf_sc.predict(X_test_sc)
+        clf_proba = clf_sc.predict_proba(X_test_sc)[:, 1]
+        test_acc  = accuracy_score(y_test_sc_clf, clf_pred)
+        test_f1   = f1_score(y_test_sc_clf, clf_pred, zero_division=0)
+        test_auc  = roc_auc_score(y_test_sc_clf, clf_proba)
+
+        log.info(f"\n  SC REGRESSION on test:")
+        log.info(f"    MAE  = {test_mae:.4f}s")
+        log.info(f"    RMSE = {test_rmse:.4f}s")
+        log.info(f"    R2   = {test_r2:.4f}")
+        log.info(f"\n  SC CLASSIFICATION on test:")
+        log.info(f"    Accuracy = {test_acc:.4f}")
+        log.info(f"    F1       = {test_f1:.4f}")
+        log.info(f"    AUC      = {test_auc:.4f}")
+
+        # Comparison table
+        log.info(f"\n  Full vs SC — Test Set Comparison:")
+        log.info(f"    {'Metric':<20} {'Full Dataset':>15} {'Same Compound':>15}")
+        log.info(f"    {'-'*50}")
+        log.info(f"    {'Reg MAE':<20} {'0.6679s':>15} {test_mae:>14.4f}s")
+        log.info(f"    {'Reg R2':<20} {'0.4283':>15} {test_r2:>15.4f}")
+        log.info(f"    {'Clf AUC':<20} {'0.8571':>15} {test_auc:>15.4f}")
+        log.info(f"    {'Clf F1':<20} {'0.8000':>15} {test_f1:>15.4f}")
+
+        # Plot
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        fig.suptitle("SC Test Set Evaluation — Same-Compound Laps Only", fontsize=13)
+
+        colors_race = {"Bahrain": "#1E3A8A", "Spain": "#15803D", "AbuDhabi": "#B45309"}
+        for race in test_sc_df["Race"].unique():
+            mask = test_sc_df["Race"].values == race
+            axes[0].scatter(y_test_sc_reg[mask], reg_pred[mask],
+                            label=race, color=colors_race.get(race, "gray"),
+                            alpha=0.8, s=60)
+        mn = min(y_test_sc_reg.min(), reg_pred.min()) - 0.2
+        mx = max(y_test_sc_reg.max(), reg_pred.max()) + 0.2
+        axes[0].plot([mn, mx], [mn, mx], "r--", linewidth=1, label="Perfect")
+        axes[0].set_xlabel("Actual Delta (s)")
+        axes[0].set_ylabel("Predicted Delta (s)")
+        axes[0].set_title(f"SC Regression — MAE={test_mae:.3f}s  R2={test_r2:.3f}")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].hist(clf_proba[y_test_sc_clf == 0], bins=8, alpha=0.6,
+                     color="#15803D", label="HAM Faster (actual)")
+        axes[1].hist(clf_proba[y_test_sc_clf == 1], bins=8, alpha=0.6,
+                     color="#1E3A8A", label="VER Faster (actual)")
+        axes[1].axvline(0.5, color="red", linestyle="--", label="Decision boundary")
+        axes[1].set_xlabel("Predicted Probability (VER Faster)")
+        axes[1].set_ylabel("Count")
+        axes[1].set_title(f"SC Classifier — AUC={test_auc:.3f}  F1={test_f1:.3f}")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        save_fig(fig, "14_sc_test_set_evaluation.png")
+
+        return {
+            "sc_test_mae" : test_mae,
+            "sc_test_rmse": test_rmse,
+            "sc_test_r2"  : test_r2,
+            "sc_test_acc" : test_acc,
+            "sc_test_f1"  : test_f1,
+            "sc_test_auc" : test_auc,
+        }
+
+    except Exception as e:
+        raise CustomException(e, sys)
+    
 
 # ─────────────────────────────────────────
 # MAIN
@@ -503,61 +661,77 @@ def run_diagnostics():
         log.info("Starting model diagnostics")
         log.info("=" * 60)
 
-        train, val, test, reg, clf = load_all()
+        (train, val, test,
+         train_sc, val_sc, test_sc,
+         reg, clf, reg_sc, clf_sc) = load_all()
 
         X_train = train[FEATURE_COLS].values
         X_val   = val[FEATURE_COLS].values
         X_test  = test[FEATURE_COLS].values
 
-        y_train_reg = train[TARGET_REGRESSION].values
-        y_val_reg   = val[TARGET_REGRESSION].values
-        y_test_reg  = test[TARGET_REGRESSION].values
+        X_train_sc = train_sc[FEATURE_COLS].values
+        X_val_sc   = val_sc[FEATURE_COLS].values
+        X_test_sc  = test_sc[FEATURE_COLS].values
 
-        y_train_clf = train[TARGET_CLASSIFICATION].values
-        y_val_clf   = val[TARGET_CLASSIFICATION].values
-        y_test_clf  = test[TARGET_CLASSIFICATION].values
+        y_train_reg    = train[TARGET_REGRESSION].values
+        y_val_reg      = val[TARGET_REGRESSION].values
+        y_test_reg     = test[TARGET_REGRESSION].values
+        y_train_clf    = train[TARGET_CLASSIFICATION].values
+        y_val_clf      = val[TARGET_CLASSIFICATION].values
+        y_test_clf     = test[TARGET_CLASSIFICATION].values
 
-        # Plot 1 — Learning curve
+        y_test_sc_reg  = test_sc[TARGET_REGRESSION].values
+        y_test_sc_clf  = test_sc[TARGET_CLASSIFICATION].values
+
+        # ── Full model diagnostics ──
+        log.info("\n>>> FULL MODEL DIAGNOSTICS")
         plot_learning_curve(reg, X_train, y_train_reg, X_val, y_val_reg)
-
-        # Plot 2 — Residuals
         plot_residuals(reg, X_val, y_val_reg, val)
-
-        # Plot 3 — Classification diagnostics
         plot_classification_diagnostics(clf, X_val, y_val_clf)
-
-        # Plot 4 — SHAP regression
         plot_shap_regression(reg, X_train, X_val)
-
-        # Plot 5 — SHAP classifier
         plot_shap_classifier(clf, X_train, X_val)
-
-        # Plot 6 — Driver fingerprint
         plot_driver_fingerprint(train, val, test)
+        full_results = evaluate_test_set(
+            reg, clf, X_test, y_test_reg, y_test_clf, test
+        )
 
-        # Test set evaluation
-        test_results = evaluate_test_set(
-            reg, clf,
-            X_test, y_test_reg, y_test_clf, test
+        # ── SC model diagnostics ──
+        log.info("\n>>> SAME-COMPOUND MODEL DIAGNOSTICS")
+        plot_shap_regression_sc(reg_sc, X_train_sc, X_val_sc)
+        sc_results = evaluate_test_set_sc(
+            reg_sc, clf_sc, X_test_sc,
+            y_test_sc_reg, y_test_sc_clf, test_sc
         )
 
         log.info("=" * 60)
-        log.info("Model diagnostics complete. All plots saved to artifacts/")
+        log.info("All diagnostics complete. Plots saved to artifacts/")
         log.info("=" * 60)
 
-        return test_results
+        return full_results, sc_results
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 if __name__ == "__main__":
-    test_results = run_diagnostics()
+    full_results, sc_results = run_diagnostics()
 
-    print("\n--- FINAL TEST SET RESULTS ---")
-    print(f"Regression  MAE  : {test_results['test_mae']:.4f}s")
-    print(f"Regression  RMSE : {test_results['test_rmse']:.4f}s")
-    print(f"Regression  R2   : {test_results['test_r2']:.4f}")
-    print(f"Classifier  Acc  : {test_results['test_acc']:.4f}")
-    print(f"Classifier  F1   : {test_results['test_f1']:.4f}")
-    print(f"Classifier  AUC  : {test_results['test_auc']:.4f}")
+    print("\n--- FULL DATASET TEST RESULTS ---")
+    print(f"Regression  MAE  : {full_results['test_mae']:.4f}s")
+    print(f"Regression  R2   : {full_results['test_r2']:.4f}")
+    print(f"Classifier  AUC  : {full_results['test_auc']:.4f}")
+    print(f"Classifier  F1   : {full_results['test_f1']:.4f}")
+
+    print("\n--- SAME-COMPOUND TEST RESULTS ---")
+    print(f"Regression  MAE  : {sc_results['sc_test_mae']:.4f}s")
+    print(f"Regression  R2   : {sc_results['sc_test_r2']:.4f}")
+    print(f"Classifier  AUC  : {sc_results['sc_test_auc']:.4f}")
+    print(f"Classifier  F1   : {sc_results['sc_test_f1']:.4f}")
+
+    print("\n--- IMPROVEMENT SUMMARY ---")
+    reg_improvement = full_results['test_mae'] - sc_results['sc_test_mae']
+    auc_improvement = sc_results['sc_test_auc'] - full_results['test_auc']
+    print(f"Regression MAE improved by : {reg_improvement:+.4f}s "
+          f"({'better' if reg_improvement > 0 else 'worse'})")
+    print(f"Classifier AUC shifted by  : {auc_improvement:+.4f} "
+          f"({'better' if auc_improvement > 0 else 'worse'})")
