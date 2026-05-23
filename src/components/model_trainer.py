@@ -19,7 +19,9 @@ from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
     TRAIN_PATH, VAL_PATH,
+    TRAIN_SC_PATH, VAL_SC_PATH,
     CLASSIFIER_PATH, REGRESSOR_PATH,
+    CLASSIFIER_SC_PATH, REGRESSOR_SC_PATH,
     TARGET_REGRESSION, TARGET_CLASSIFICATION,
     INITIAL_MODEL_PARAMS
 )
@@ -28,7 +30,7 @@ from src.config import (
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
-    "brake_zone_count_delta", "tyre_life_delta",
+    "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
@@ -212,10 +214,6 @@ def train_regressors(X_train, y_train, X_val, y_val):
                            if "XGBoost" in best_result["label"]
                            else {})
 
-        # Save best regressor
-        with open(REGRESSOR_PATH, "wb") as f:
-            pickle.dump(best_reg_model, f)
-        log.info(f"  Best regressor saved → {REGRESSOR_PATH}")
 
         return best_reg_model, best_reg_params, results
 
@@ -309,11 +307,6 @@ def train_classifiers(X_train, y_train, X_val, y_val):
                            if "XGBoost" in best_result["label"]
                            else {})
 
-        # Save best classifier
-        with open(CLASSIFIER_PATH, "wb") as f:
-            pickle.dump(best_clf_model, f)
-        log.info(f"  Best classifier saved → {CLASSIFIER_PATH}")
-
         return best_clf_model, best_clf_params, results
 
     except Exception as e:
@@ -323,15 +316,15 @@ def train_classifiers(X_train, y_train, X_val, y_val):
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-
 def run_model_trainer():
     try:
         log.info("=" * 60)
         log.info("Starting model training")
         log.info("=" * 60)
 
+        # ── FULL DATASET ──
+        log.info("\n>>> FULL DATASET (all compound combinations)")
         train, val = load_splits()
-
         X_train = train[FEATURE_COLS].values
         X_val   = val[FEATURE_COLS].values
         y_train_reg = train[TARGET_REGRESSION].values
@@ -339,37 +332,82 @@ def run_model_trainer():
         y_train_clf = train[TARGET_CLASSIFICATION].values
         y_val_clf   = val[TARGET_CLASSIFICATION].values
 
-        # Train regressors
         best_reg, best_reg_params, reg_results = train_regressors(
             X_train, y_train_reg, X_val, y_val_reg
         )
-
-        # Train classifiers
         best_clf, best_clf_params, clf_results = train_classifiers(
             X_train, y_train_clf, X_val, y_val_clf
         )
-
-        # Auto-update config.py
         update_config_best_params(best_reg_params, best_clf_params)
 
+        with open(REGRESSOR_PATH, "wb") as f:
+            pickle.dump(best_reg, f)
+        log.info(f"Full regressor saved → {REGRESSOR_PATH}")
+
+        with open(CLASSIFIER_PATH, "wb") as f:
+            pickle.dump(best_clf, f)
+        log.info(f"Full classifier saved → {CLASSIFIER_PATH}")
+
+        # ── SAME-COMPOUND SUBSET ──
+        log.info("\n>>> SAME-COMPOUND SUBSET (driving style isolated)")
+        train_sc = pd.read_csv(TRAIN_SC_PATH)
+        val_sc   = pd.read_csv(VAL_SC_PATH)
+        log.info(f"SC Train: {train_sc.shape} | SC Val: {val_sc.shape}")
+
+        X_train_sc = train_sc[FEATURE_COLS].values
+        X_val_sc   = val_sc[FEATURE_COLS].values
+        y_train_sc_reg = train_sc[TARGET_REGRESSION].values
+        y_val_sc_reg   = val_sc[TARGET_REGRESSION].values
+        y_train_sc_clf = train_sc[TARGET_CLASSIFICATION].values
+        y_val_sc_clf   = val_sc[TARGET_CLASSIFICATION].values
+
+        best_reg_sc, best_reg_sc_params, reg_sc_results = train_regressors(
+            X_train_sc, y_train_sc_reg, X_val_sc, y_val_sc_reg
+        )
+        best_clf_sc, best_clf_sc_params, clf_sc_results = train_classifiers(
+            X_train_sc, y_train_sc_clf, X_val_sc, y_val_sc_clf
+        )
+
+        # Save SC models separately
+        with open(REGRESSOR_SC_PATH,  "wb") as f:
+            pickle.dump(best_reg_sc, f)
+        with open(CLASSIFIER_SC_PATH, "wb") as f:
+            pickle.dump(best_clf_sc, f)
+        log.info(f"SC Regressor  saved → {REGRESSOR_SC_PATH}")
+        log.info(f"SC Classifier saved → {CLASSIFIER_SC_PATH}")
+
         log.info("Model training complete.")
-        return best_reg, best_clf, reg_results, clf_results
+        return (best_reg, best_clf, reg_results, clf_results,
+                best_reg_sc, best_clf_sc, reg_sc_results, clf_sc_results)
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 if __name__ == "__main__":
-    best_reg, best_clf, reg_results, clf_results = run_model_trainer()
+    (best_reg, best_clf, reg_results, clf_results,
+     best_reg_sc, best_clf_sc, reg_sc_results, clf_sc_results) = run_model_trainer()
 
-    print("\n--- REGRESSION RESULTS SUMMARY ---")
+    print("\n--- FULL DATASET — REGRESSION ---")
     print(f"{'Model':<30} {'MAE':>8} {'RMSE':>8} {'R2':>8}")
     print("-" * 58)
     for r in reg_results:
         print(f"{r['label']:<30} {r['MAE']:>8.4f} {r['RMSE']:>8.4f} {r['R2']:>8.4f}")
 
-    print("\n--- CLASSIFICATION RESULTS SUMMARY ---")
+    print("\n--- FULL DATASET — CLASSIFICATION ---")
     print(f"{'Model':<30} {'Accuracy':>10} {'F1':>8} {'AUC':>8}")
     print("-" * 60)
     for r in clf_results:
+        print(f"{r['label']:<30} {r['Accuracy']:>10.4f} {r['F1']:>8.4f} {r['AUC']:>8.4f}")
+
+    print("\n--- SAME-COMPOUND SUBSET — REGRESSION ---")
+    print(f"{'Model':<30} {'MAE':>8} {'RMSE':>8} {'R2':>8}")
+    print("-" * 58)
+    for r in reg_sc_results:
+        print(f"{r['label']:<30} {r['MAE']:>8.4f} {r['RMSE']:>8.4f} {r['R2']:>8.4f}")
+
+    print("\n--- SAME-COMPOUND SUBSET — CLASSIFICATION ---")
+    print(f"{'Model':<30} {'Accuracy':>10} {'F1':>8} {'AUC':>8}")
+    print("-" * 60)
+    for r in clf_sc_results:
         print(f"{r['label']:<30} {r['Accuracy']:>10.4f} {r['F1']:>8.4f} {r['AUC']:>8.4f}")

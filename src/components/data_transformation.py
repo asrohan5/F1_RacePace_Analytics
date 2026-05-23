@@ -8,8 +8,10 @@ from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
     LAPS_RAW_PATH, TELEMETRY_RAW_PATH,
-    FEATURES_PATH, PREPROCESSOR_PATH,
+    FEATURES_PATH, FEATURES_SAME_COMPOUND_PATH,
+    PREPROCESSOR_PATH,
     TRAIN_PATH, VAL_PATH, TEST_PATH,
+    TRAIN_SC_PATH, VAL_SC_PATH, TEST_SC_PATH,
     MIN_BRAKE_ZONE_LENGTH_M,
     THROTTLE_OFF_THRESHOLD, FULL_THROTTLE_THRESHOLD,
     TRAIN_RATIO, VAL_RATIO, TEST_RATIO,
@@ -220,6 +222,12 @@ def engineer_features(paired):
         df["avg_entry_speed_delta"]      = df["VER_avg_entry_speed"]      - df["HAM_avg_entry_speed"]
         df["brake_zone_count_delta"]     = df["VER_brake_zone_count"]     - df["HAM_brake_zone_count"]
         df["tyre_life_delta"]            = df["VER_TyreLife"]             - df["HAM_TyreLife"]
+        
+        # ── Update after model_diagnostics: Tyre life interaction feature ──
+        # Captures whether VER's coasting advantage changes as tyre age difference grows
+        # High positive = VER coasts more AND has older tyres (style under pressure)
+        # High negative = VER coasts more BUT has fresher tyres (style on new rubber)
+        df["tyre_life_x_coasting_delta"] = df["tyre_life_delta"] * df["coasting_pct_delta"]
 
         # ── same_compound flag ──
         df["same_compound"] = (df["VER_Compound"] == df["HAM_Compound"]).astype(int)
@@ -268,6 +276,8 @@ def get_feature_columns():
         "avg_entry_speed_delta",
         "brake_zone_count_delta",
         "tyre_life_delta",
+        
+        "tyre_life_x_coasting_delta",
 
         # Individual driver features — context
         "VER_coasting_pct",
@@ -421,6 +431,38 @@ def run_transformation():
         log.info(f"Val   saved → {VAL_PATH}")
         log.info(f"Test  saved → {TEST_PATH}")
 
+        # ── Save same-compound subset ──
+        # Primary model will train on this — isolates driving style from tyre strategy
+        df_same = df[df["same_compound"] == 1].copy()
+        df_same.to_csv(FEATURES_SAME_COMPOUND_PATH, index=False)
+        log.info(f"Same-compound subset saved → {FEATURES_SAME_COMPOUND_PATH} "
+                f"| shape: {df_same.shape} "
+                f"| {len(df_same)} of {len(df)} paired laps ({100*len(df_same)/len(df):.1f}%)")
+
+        # Split same-compound subset
+        log.info("Splitting same-compound subset...")
+        train_sc, val_sc, test_sc = split_data(df_same)
+
+        # Scale same-compound splits using same scaler fitted on full train
+        feature_cols_sc = get_feature_columns()
+        train_sc_scaled = train_sc.copy()
+        val_sc_scaled   = val_sc.copy()
+        test_sc_scaled  = test_sc.copy()
+
+        train_sc_scaled[feature_cols_sc] = scaler.transform(train_sc[feature_cols_sc])
+        val_sc_scaled[feature_cols_sc]   = scaler.transform(val_sc[feature_cols_sc])
+        test_sc_scaled[feature_cols_sc]  = scaler.transform(test_sc[feature_cols_sc])
+
+        train_sc_scaled.to_csv(TRAIN_SC_PATH, index=False)
+        val_sc_scaled.to_csv(VAL_SC_PATH,     index=False)
+        test_sc_scaled.to_csv(TEST_SC_PATH,   index=False)
+
+        log.info(f"Same-compound splits — train={len(train_sc)} | "
+                f"val={len(val_sc)} | test={len(test_sc)}")
+        log.info(f"SC Train saved → {TRAIN_SC_PATH}")
+        log.info(f"SC Val   saved → {VAL_SC_PATH}")
+        log.info(f"SC Test  saved → {TEST_SC_PATH}")
+
         log.info("Data transformation complete.")
         return train_df, val_df, test_df, feature_cols
 
@@ -446,3 +488,14 @@ if __name__ == "__main__":
     print(train_df[feature_cols].isnull().sum()[train_df[feature_cols].isnull().sum() > 0])
     if train_df[feature_cols].isnull().sum().sum() == 0:
         print("  None — all features complete.")
+    
+
+    print(f"\nSame-compound subset:")
+    sc = pd.read_csv(FEATURES_SAME_COMPOUND_PATH)
+    print(f"  Shape     : {sc.shape}")
+    print(f"  Races     : {sc['Race'].value_counts().to_dict()}")
+    print(f"  Target mean : {sc[TARGET_REGRESSION].mean():.3f}s")
+    print(f"  Class balance : {sc[TARGET_CLASSIFICATION].value_counts().to_dict()}")
+    print(f"\nNew feature 'tyre_life_x_coasting_delta' stats:")
+    raw = pd.read_csv(FEATURES_PATH)
+    print(raw["tyre_life_x_coasting_delta"].describe().round(3))

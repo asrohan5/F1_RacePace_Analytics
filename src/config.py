@@ -31,6 +31,11 @@ TELEMETRY_RAW_PATH = os.path.join(DATA_RAW_DIR, "telemetry_raw.parquet")
 FEATURES_PATH      = os.path.join(DATA_PROCESSED_DIR, "features.csv")
 PREPROCESSOR_PATH  = os.path.join(MODELS_DIR, "preprocessor.pkl")
 
+FEATURES_SAME_COMPOUND_PATH = os.path.join(DATA_PROCESSED_DIR, "features_same_compound.csv")
+TRAIN_SC_PATH = os.path.join(DATA_SPLITS_DIR, "train_sc.csv")
+VAL_SC_PATH   = os.path.join(DATA_SPLITS_DIR, "val_sc.csv")
+TEST_SC_PATH  = os.path.join(DATA_SPLITS_DIR, "test_sc.csv")
+
 # ─────────────────────────────────────────
 # SPLIT FILE PATHS  (saved by data_transformation.py)
 # ─────────────────────────────────────────
@@ -43,6 +48,8 @@ TEST_PATH     = os.path.join(DATA_SPLITS_DIR, "test.csv")
 # ─────────────────────────────────────────
 CLASSIFIER_PATH = os.path.join(MODELS_DIR, "classifier.pkl")
 REGRESSOR_PATH  = os.path.join(MODELS_DIR, "regressor.pkl")
+CLASSIFIER_SC_PATH = os.path.join(MODELS_DIR, "classifier_sc.pkl")
+REGRESSOR_SC_PATH  = os.path.join(MODELS_DIR, "regressor_sc.pkl")
 
 # ─────────────────────────────────────────
 # RACE CONFIGURATION
@@ -138,7 +145,7 @@ INITIAL_MODEL_PARAMS = {
 # BEST PARAMS  (empty — auto-populated by model_trainer.py after GridSearch)
 # ─────────────────────────────────────────
 BEST_CLASSIFIER_PARAMS = {}
-BEST_REGRESSOR_PARAMS = {'n_estimators': 50, 'min_samples_leaf': 2, 'max_features': 0.5, 'max_depth': 5}
+BEST_REGRESSOR_PARAMS = {'subsample': 0.6, 'reg_lambda': 5, 'reg_alpha': 0.1, 'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.1, 'colsample_bytree': 1.0}
 
 
 if __name__ == "__main__":
