@@ -95,20 +95,24 @@ def check_train_val_gap(model, X_train, y_train, X_val, y_val,
         # Interpret the gap
         if task == "regression":
             if gap > 0.15:
-                log.info("  DIAGNOSIS: OVERFITTING — gap > 0.15s MAE. "
-                         "Consider increasing min_samples_leaf or reducing max_depth.")
-            elif train_score > 0.50 and val_score > 0.50:
-                log.info("  DIAGNOSIS: UNDERFITTING — both train and val MAE are high. "
-                         "Consider engineering more features.")
+                log.info("  TRAIN-VAL GAP: Large (>{:.3f}s) — suggests overfitting on train.".format(gap))
             else:
-                log.info("  DIAGNOSIS: GOOD FIT — gap is acceptable.")
+                log.info("  TRAIN-VAL GAP: Small ({:.3f}s) — but val set has only 21 rows.".format(gap))
+                log.info("  NOTE: Small gap on 21 rows is not evidence of good generalisation.")
+                log.info("        Check CV MAE for the honest estimate.")
         else:
+            gap_pct = abs(train_score - val_score)
             if train_score > val_score + 0.10:
-                log.info("  DIAGNOSIS: OVERFITTING — train F1 significantly above val F1.")
+                log.info("  TRAIN-VAL GAP: Large — train F1 significantly above val F1.")
+                log.info("  NOTE: This suggests memorisation of train laps.")
             elif train_score < 0.60 and val_score < 0.60:
-                log.info("  DIAGNOSIS: UNDERFITTING — both train and val F1 are low.")
+                log.info("  TRAIN-VAL GAP: Both scores low — model is not learning the signal.")
             else:
-                log.info("  DIAGNOSIS: GOOD FIT — scores are consistent.")
+                log.info("  TRAIN-VAL GAP: Small ({:.4f}) — but val set has only 21 rows.".format(
+                    gap_pct))
+                log.info("  NOTE: Val F1 on 21 rows is unreliable regardless of gap size.")
+                log.info("        A perfect val F1 on 21 rows means nothing statistically.")
+                log.info("        CV F1 is the only honest metric — check FIT SUMMARY below.")
 
         return train_score, val_score, gap
 
@@ -394,23 +398,47 @@ def print_fit_summary(train_reg_score, val_reg_score,
 
         log.info("\n  RECOMMENDED NEXT STEP:")
 
-        if reg_gap > 0.15:
-            log.info("  → Regression is OVERFITTING.")
-            log.info("    Try: increase min_samples_leaf (8-15), reduce max_depth (3-4),")
-            log.info("    OR:  add L2 regularization via reg_alpha/reg_lambda in XGBoost.")
-        elif train_reg_score > 0.40:
-            log.info("  → Regression is UNDERFITTING.")
-            log.info("    Try: add stint_phase feature, rolling lap delta, "
-                     "compound interaction term.")
+        # Regression verdict — CV MAE is the honest number, not train-val gap
+        if cv_results["reg_cv_mae"].mean() > 0.50:
+            log.info("  → Regression CV MAE is HIGH (>{:.3f}s). Model is NOT reliable.".format(
+                cv_results["reg_cv_mae"].mean()))
+            log.info("    Val MAE ({:.3f}s) is misleadingly low due to small val set (21 rows).".format(
+                val_reg_score))
+            log.info("    Do NOT use val MAE as performance claim. Use CV MAE.")
+            log.info("    Action: Phase 2 — more data is the only real fix.")
+        elif cv_results["reg_cv_mae"].mean() > 0.35:
+            log.info("  → Regression CV MAE is MODERATE ({:.3f}s ± {:.3f}s).".format(
+                cv_results["reg_cv_mae"].mean(), cv_results["reg_cv_mae"].std()))
+            log.info("    Acceptable for Phase 1 methodology proof. Not production-ready.")
         else:
-            log.info("  → Regression fit is ACCEPTABLE. Proceed to diagnostics.")
+            log.info("  → Regression CV MAE is ACCEPTABLE ({:.3f}s).".format(
+                cv_results["reg_cv_mae"].mean()))
 
-        if cv_results["clf_cv_f1"].mean() < 0.55:
-            log.info("  → Classifier CV F1 is LOW — model is not generalizing well.")
-            log.info("    Try: add interaction feature (coasting_pct * same_compound),")
-            log.info("    OR:  use stint_phase to stratify predictions.")
+        # Classification verdict — CV F1 is the honest number
+        if cv_results["clf_cv_f1"].mean() < 0.40:
+            log.info("  → Classifier CV F1 is LOW ({:.3f} ± {:.3f}).".format(
+                cv_results["clf_cv_f1"].mean(), cv_results["clf_cv_f1"].std()))
+            log.info("    Val F1 ({:.3f}) is misleadingly high — val set is too small to trust.".format(
+                val_clf_score))
+            log.info("    Chrono-CV AUC ({:.3f}) is the only reliable classifier metric.".format(
+                cv_results["clf_cv_auc"].mean()))
+            log.info("    Action: Phase 2 — more data and leave-one-race-out CV required.")
+        elif cv_results["clf_cv_f1"].mean() < 0.60:
+            log.info("  → Classifier CV F1 is MODERATE ({:.3f}). Directional predictions".format(
+                cv_results["clf_cv_f1"].mean()))
+            log.info("    are meaningful but not reliable for production use.")
         else:
-            log.info("  → Classifier fit is ACCEPTABLE. Proceed to diagnostics.")
+            log.info("  → Classifier CV F1 is ACCEPTABLE ({:.3f}).".format(
+                cv_results["clf_cv_f1"].mean()))
+
+        log.info("\n  HONEST VERDICT:")
+        log.info("    Regression: CV MAE={:.3f}s (val MAE={:.3f}s — val is NOT representative)".format(
+            cv_results["reg_cv_mae"].mean(), val_reg_score))
+        log.info("    Classifier: CV F1={:.3f} | CV AUC={:.3f} (val F1={:.3f} — NOT representative)".format(
+            cv_results["clf_cv_f1"].mean(), cv_results["clf_cv_auc"].mean(), val_clf_score))
+        log.info("    Phase 1 establishes methodology. Results are directionally valid,")
+        log.info("    not statistically robust. Phase 2 required for production claims.")
+
 
     except Exception as e:
         raise CustomException(e, sys)
