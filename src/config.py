@@ -145,7 +145,7 @@ INITIAL_MODEL_PARAMS = {
 # BEST PARAMS  (empty — auto-populated by model_trainer.py after GridSearch)
 # ─────────────────────────────────────────
 BEST_CLASSIFIER_PARAMS = {}
-BEST_REGRESSOR_PARAMS = {'subsample': 0.6, 'reg_lambda': 5, 'reg_alpha': 0.1, 'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.1, 'colsample_bytree': 1.0}
+BEST_REGRESSOR_PARAMS = {'subsample': 0.6, 'reg_alpha': 0.1, 'num_leaves': 31, 'n_estimators': 50, 'min_child_samples': 20, 'max_depth': 4, 'learning_rate': 0.1}
 
 
 if __name__ == "__main__":

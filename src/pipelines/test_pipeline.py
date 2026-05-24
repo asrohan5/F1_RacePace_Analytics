@@ -3,6 +3,8 @@ import sys
 import pickle
 import pandas as pd
 
+from sklearn.metrics import mean_absolute_error, accuracy_score
+
 from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
@@ -13,16 +15,22 @@ from src.config import (
     TARGET_REGRESSION, TARGET_CLASSIFICATION
 )
 
+import warnings
+warnings.filterwarnings('ignore')
+
+
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
     "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
+    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
     "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
     "VER_avg_entry_speed", "HAM_avg_entry_speed",
     "VER_TyreLife", "HAM_TyreLife",
+    "VER_stint_phase", "HAM_stint_phase",
     "same_compound", "VER_compound_enc", "HAM_compound_enc",
     "LapNumber", "race_enc"
 ]
@@ -211,6 +219,62 @@ def run_test_pipeline():
         log.info(f"  {'Classifier F1':<25} "
                  f"{full_clf_metrics['F1']:>10.4f} "
                  f"{sc_clf_metrics['F1']:>10.4f}")
+                
+        # ── Per-race breakdown — what manager actually wants to see ──
+        log.info("\n--- PER-RACE TEST METRICS ---")
+        log.info(f"  {'Race':<12} {'Full MAE':>10} {'Full Acc':>10} "
+                f"{'SC MAE':>10} {'SC Acc':>10} {'N_full':>7} {'N_sc':>5}")
+        log.info(f"  {'-'*62}")
+
+        for race in test["Race"].unique():
+            # Full model
+            full_mask = test["Race"].values == race
+            if full_mask.sum() > 0:
+                f_mae = mean_absolute_error(
+                    y_test_reg[full_mask], reg.predict(X_test[full_mask])
+                )
+                f_acc = accuracy_score(
+                    y_test_clf[full_mask], clf.predict(X_test[full_mask])
+                )
+            else:
+                f_mae = f_acc = float("nan")
+
+            # SC model
+            sc_mask = test_sc["Race"].values == race
+            if sc_mask.sum() > 0:
+                sc_mae = mean_absolute_error(
+                    y_test_sc_reg[sc_mask], reg_sc.predict(X_test_sc[sc_mask])
+                )
+                sc_acc = accuracy_score(
+                    y_test_sc_clf[sc_mask], clf_sc.predict(X_test_sc[sc_mask])
+                )
+            else:
+                sc_mae = sc_acc = float("nan")
+
+            log.info(f"  {race:<12} {f_mae:>10.4f} {f_acc:>10.4f} "
+                    f"{sc_mae:>10.4f} {sc_acc:>10.4f} "
+                    f"{full_mask.sum():>7} {sc_mask.sum():>5}")
+
+        # ── High confidence prediction accuracy ──
+        log.info("\n--- HIGH CONFIDENCE PREDICTIONS (probability > 0.80) ---")
+        high_conf_mask = clf_proba > 0.80
+        if high_conf_mask.sum() > 0:
+            hc_acc = accuracy_score(
+                y_test_clf[high_conf_mask], clf_pred[high_conf_mask]
+            )
+            log.info(f"  Full model: {high_conf_mask.sum()} predictions with prob > 0.80 | "
+                    f"Accuracy = {hc_acc:.4f} "
+                    f"({high_conf_mask.sum()}/{len(y_test_clf)} total test laps)")
+        else:
+            log.info("  No predictions with probability > 0.80 on test set")
+
+        sc_high_conf = clf_sc_proba > 0.80
+        if sc_high_conf.sum() > 0:
+            sc_hc_acc = accuracy_score(
+                y_test_sc_clf[sc_high_conf], clf_sc_pred[sc_high_conf]
+            )
+            log.info(f"  SC model  : {sc_high_conf.sum()} predictions with prob > 0.80 | "
+                    f"Accuracy = {sc_hc_acc:.4f}")
 
         log.info("=" * 60)
         log.info("TEST PIPELINE — COMPLETE")

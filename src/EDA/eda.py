@@ -7,10 +7,12 @@ import matplotlib.gridspec as gridspec
 
 from src.logger import logging as log
 from src.exception import CustomException
+
 from src.config import (
     LAPS_RAW_PATH, TELEMETRY_RAW_PATH, ARTIFACTS_DIR,
     THROTTLE_OFF_THRESHOLD, FULL_THROTTLE_THRESHOLD,
-    MIN_BRAKE_ZONE_LENGTH_M, DRIVERS
+    MIN_BRAKE_ZONE_LENGTH_M, DRIVERS,
+    CACHE_DIR, SEASON, RACES, SESSION_TYPE
 )
 
 
@@ -490,6 +492,205 @@ def eda_target(laps):
 
     except Exception as e:
         raise CustomException(e, sys)
+    
+# ─────────────────────────────────────────
+# SECTION 7 — TEAMMATE COMPARISON
+# Separates driver style from car design philosophy
+# VER vs PER (same Red Bull), HAM vs BOT (same Mercedes)
+# ─────────────────────────────────────────
+
+def eda_teammate_comparison(session_cache_dir):
+    """
+    Pull Perez and Bottas telemetry for the same 3 races.
+    Compute within-team style residuals:
+        VER_style = VER_metric - PER_metric  (pure driver, same car)
+        HAM_style = HAM_metric - BOT_metric  (pure driver, same car)
+    Compare VER_style vs HAM_style.
+    If VER coasts more than Perez in the same car -> that is VER's choice.
+    If VER and Perez coast equally -> that is the Red Bull car requiring it.
+    """
+    try:
+        import fastf1
+        fastf1.Cache.enable_cache(session_cache_dir)
+
+        log.info("=" * 60)
+        log.info("SECTION 7 — Teammate Comparison (Style vs Car)")
+        log.info("=" * 60)
+
+        # Drivers to compare: {driver: teammate}
+        teammate_pairs = {"VER": "PER", "HAM": "BOT"}
+        all_drivers    = ["VER", "PER", "HAM", "BOT"]
+
+        style_records = []
+
+        for round_number, race_label in RACES:
+            log.info(f"\n  Loading {race_label} for teammate comparison...")
+            session = fastf1.get_session(SEASON, round_number, SESSION_TYPE)
+            session.load(telemetry=True, laps=True, weather=False, messages=False)
+
+            driver_metrics = {}
+
+            for driver in all_drivers:
+                try:
+                    laps = session.laps.pick_drivers(driver).pick_quicklaps().copy()
+                    if len(laps) < 5:
+                        log.info(f"    {driver} has fewer than 5 clean laps in "
+                                 f"{race_label} — skipping")
+                        continue
+
+                    coasting_vals   = []
+                    full_thr_vals   = []
+                    gear_shift_vals = []
+                    brake_len_vals  = []
+
+                    for _, lap in laps.iterrows():
+                        try:
+                            tel = lap.get_telemetry()
+                        except Exception:
+                            continue
+
+                        tel = tel.sort_values("Distance").reset_index(drop=True)
+                        brake    = tel["Brake"].astype(bool)
+                        throttle = tel["Throttle"]
+                        gear     = tel["nGear"]
+
+                        # Coasting %
+                        coasting = ((throttle < THROTTLE_OFF_THRESHOLD) & (~brake))
+                        coasting_vals.append(coasting.mean() * 100)
+
+                        # Full throttle %
+                        full_thr_vals.append(
+                            (throttle >= FULL_THROTTLE_THRESHOLD).mean() * 100
+                        )
+
+                        # Gear shifts
+                        gear_shift_vals.append((gear.diff().abs() > 0).sum())
+
+                        # Avg brake zone length
+                        zone_id = (brake != brake.shift()).cumsum()
+                        brake_lengths = tel[brake].groupby(
+                            zone_id[brake])["Distance"].agg(
+                            lambda x: x.max() - x.min()
+                        )
+                        real_zones = brake_lengths[
+                            brake_lengths >= MIN_BRAKE_ZONE_LENGTH_M
+                        ]
+                        brake_len_vals.append(
+                            real_zones.mean() if len(real_zones) > 0 else 0.0
+                        )
+
+                    if len(coasting_vals) == 0:
+                        continue
+
+                    driver_metrics[driver] = {
+                        "coasting_pct"      : np.mean(coasting_vals),
+                        "full_throttle_pct" : np.mean(full_thr_vals),
+                        "gear_shifts"       : np.mean(gear_shift_vals),
+                        "brake_zone_length" : np.mean(brake_len_vals),
+                    }
+                    log.info(f"    {driver} | coasting={np.mean(coasting_vals):.2f}% | "
+                             f"full_thr={np.mean(full_thr_vals):.2f}% | "
+                             f"gear_shifts={np.mean(gear_shift_vals):.1f} | "
+                             f"brake_len={np.mean(brake_len_vals):.1f}m")
+
+                except Exception as ex:
+                    log.warning(f"    Could not process {driver} in {race_label}: {ex}")
+                    continue
+
+            # Compute within-team residuals
+            for driver, teammate in teammate_pairs.items():
+                if driver in driver_metrics and teammate in driver_metrics:
+                    for metric in ["coasting_pct", "full_throttle_pct",
+                                   "gear_shifts", "brake_zone_length"]:
+                        style_records.append({
+                            "Race"     : race_label,
+                            "Driver"   : driver,
+                            "Teammate" : teammate,
+                            "Metric"   : metric,
+                            "Driver_val"  : driver_metrics[driver][metric],
+                            "Teammate_val": driver_metrics[teammate][metric],
+                            "Style_residual": (driver_metrics[driver][metric] -
+                                               driver_metrics[teammate][metric]),
+                        })
+
+        if len(style_records) == 0:
+            log.warning("  No teammate data computed — skipping Section 7 plots.")
+            return
+
+        style_df = pd.DataFrame(style_records)
+
+        log.info("\n  Within-team style residuals (Driver - Teammate, same car):")
+        log.info("  Positive = Driver does MORE of this than teammate")
+        summary = style_df.groupby(["Driver", "Metric"])["Style_residual"].mean()
+        log.info(f"\n{summary.round(3).to_string()}")
+
+        # ── Plot: style residuals per metric per race ──
+        metrics    = ["coasting_pct", "full_throttle_pct",
+                      "gear_shifts", "brake_zone_length"]
+        metric_labels = ["Coasting % (Driver - Teammate)",
+                         "Full Throttle % (Driver - Teammate)",
+                         "Gear Shifts (Driver - Teammate)",
+                         "Brake Zone Length m (Driver - Teammate)"]
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(
+            "Driver Style vs Teammate — Same Car Comparison\n"
+            "VER vs PER (Red Bull) | HAM vs BOT (Mercedes)\n"
+            "Positive = Driver does MORE of this than teammate → driver choice, not car",
+            fontsize=12
+        )
+        axes = axes.flatten()
+        colors = {"VER": "#1E3A8A", "HAM": "#15803D"}
+        races  = style_df["Race"].unique()
+        x      = np.arange(len(races))
+        width  = 0.35
+
+        for i, (metric, label) in enumerate(zip(metrics, metric_labels)):
+            ax = axes[i]
+            for j, driver in enumerate(["VER", "HAM"]):
+                vals = []
+                for race in races:
+                    row = style_df[
+                        (style_df["Driver"] == driver) &
+                        (style_df["Metric"] == metric) &
+                        (style_df["Race"]   == race)
+                    ]
+                    vals.append(row["Style_residual"].values[0]
+                                if len(row) > 0 else 0.0)
+                offset = (j - 0.5) * width
+                ax.bar(x + offset, vals, width,
+                       label=f"{driver} - teammate",
+                       color=colors[driver], alpha=0.8)
+
+            ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+            ax.set_xticks(x)
+            ax.set_xticklabels(races)
+            ax.set_ylabel(label)
+            ax.set_title(label.split("(")[0].strip())
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.2, axis="y")
+
+        plt.tight_layout()
+        save_fig(fig, "15_teammate_style_comparison.png")
+
+        # ── Log interpretation ──
+        log.info("\n  INTERPRETATION:")
+        for driver in ["VER", "HAM"]:
+            log.info(f"\n  {driver}:")
+            for metric in metrics:
+                avg_residual = style_df[
+                    (style_df["Driver"] == driver) &
+                    (style_df["Metric"] == metric)
+                ]["Style_residual"].mean()
+                direction = "MORE" if avg_residual > 0 else "LESS"
+                log.info(f"    {metric:<25} {direction} than teammate "
+                         f"by {abs(avg_residual):.3f} (avg across races)")
+
+        log.info("\n  → Residuals that are consistently positive/negative across all 3 races")
+        log.info("    are DRIVER choices. Residuals that vary by race are CAR/STRATEGY effects.")
+
+    except Exception as e:
+        raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
@@ -559,6 +760,8 @@ def print_config_recommendations(laps, tel, zone_df, delta_df):
 # ─────────────────────────────────────────
 
 def run_eda():
+
+
     try:
         laps, tel = load_data()
 
@@ -570,6 +773,13 @@ def run_eda():
         print_config_recommendations(laps, tel, zone_df, delta_df)
 
         log.info("EDA complete. All plots saved to artifacts/")
+        
+        try:
+            from src.config import CACHE_DIR, SESSION_TYPE
+            eda_teammate_comparison(CACHE_DIR)
+        except Exception as e:
+            log.warning(f"Section 7 skipped: {e}")
+    
         return laps, tel, zone_df, delta_df
 
     except Exception as e:

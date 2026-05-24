@@ -18,21 +18,28 @@ from src.config import (
     REGRESSOR_PATH, CLASSIFIER_PATH,
     TARGET_REGRESSION, TARGET_CLASSIFICATION
 )
+import warnings
+warnings.filterwarnings('ignore')
+
+
 
 
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
     "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
+    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
     "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
     "VER_avg_entry_speed", "HAM_avg_entry_speed",
     "VER_TyreLife", "HAM_TyreLife",
+    "VER_stint_phase", "HAM_stint_phase",
     "same_compound", "VER_compound_enc", "HAM_compound_enc",
     "LapNumber", "race_enc"
 ]
+
 
 # ─────────────────────────────────────────
 # LOAD DATA AND MODELS
@@ -114,54 +121,105 @@ def check_train_val_gap(model, X_train, y_train, X_val, y_val,
 # More reliable than a single val split given small data
 # ─────────────────────────────────────────
 
-def cross_validate_models(regressor, classifier, X_train, y_train_reg, y_train_clf):
+def cross_validate_models(regressor, classifier,
+                           X_train, y_train_reg, y_train_clf, train_df):
     try:
         log.info("-" * 50)
-        log.info("CROSS VALIDATION (5-fold on train set)")
+        log.info("CROSS VALIDATION — Chronological (respects time ordering)")
         log.info("-" * 50)
 
-        # Regression — KFold (continuous target)
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        # ── Custom chronological CV per race ──
+        # For each race: train on first 70%, validate on remaining 30%
+        # Then aggregate — this avoids leaking future laps into training
+        races = train_df["Race"].unique()
 
-        reg_mae_scores  = -cross_val_score(regressor, X_train, y_train_reg,
-                                            cv=kf, scoring="neg_mean_absolute_error")
-        reg_rmse_scores = np.sqrt(-cross_val_score(regressor, X_train, y_train_reg,
-                                                    cv=kf, scoring="neg_mean_squared_error"))
-        reg_r2_scores   = cross_val_score(regressor, X_train, y_train_reg,
-                                          cv=kf, scoring="r2")
+        reg_mae_folds  = []
+        reg_rmse_folds = []
+        reg_r2_folds   = []
+        clf_f1_folds   = []
+        clf_auc_folds  = []
+        clf_acc_folds  = []
 
-        log.info(f"  Regressor CV MAE  : {reg_mae_scores.mean():.4f} ± {reg_mae_scores.std():.4f}")
-        log.info(f"  Regressor CV RMSE : {reg_rmse_scores.mean():.4f} ± {reg_rmse_scores.std():.4f}")
-        log.info(f"  Regressor CV R2   : {reg_r2_scores.mean():.4f} ± {reg_r2_scores.std():.4f}")
-        log.info(f"  Regressor CV MAE per fold : {reg_mae_scores.round(4)}")
+        for race in races:
+            race_mask = train_df["Race"].values == race
+            race_idx  = np.where(race_mask)[0]
 
-        # Classification — StratifiedKFold (preserves class ratio)
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            if len(race_idx) < 10:
+                log.info(f"  {race}: too few samples ({len(race_idx)}) — skipping")
+                continue
 
-        clf_acc_scores = cross_val_score(classifier, X_train, y_train_clf,
-                                          cv=skf, scoring="accuracy")
-        clf_f1_scores  = cross_val_score(classifier, X_train, y_train_clf,
-                                          cv=skf, scoring="f1")
-        clf_auc_scores = cross_val_score(classifier, X_train, y_train_clf,
-                                          cv=skf, scoring="roc_auc")
+            # Chronological split within this race
+            split_point = int(len(race_idx) * 0.70)
+            train_idx   = race_idx[:split_point]
+            val_idx     = race_idx[split_point:]
 
-        log.info(f"  Classifier CV Acc : {clf_acc_scores.mean():.4f} ± {clf_acc_scores.std():.4f}")
-        log.info(f"  Classifier CV F1  : {clf_f1_scores.mean():.4f} ± {clf_f1_scores.std():.4f}")
-        log.info(f"  Classifier CV AUC : {clf_auc_scores.mean():.4f} ± {clf_auc_scores.std():.4f}")
-        log.info(f"  Classifier CV F1 per fold : {clf_f1_scores.round(4)}")
+            X_tr = X_train[train_idx]
+            X_vl = X_train[val_idx]
+            y_tr_reg = y_train_reg[train_idx]
+            y_vl_reg = y_train_reg[val_idx]
+            y_tr_clf = y_train_clf[train_idx]
+            y_vl_clf = y_train_clf[val_idx]
+
+            # Regression fold
+            import pickle as pkl
+            reg_copy = pkl.loads(pkl.dumps(regressor))
+            reg_copy.fit(X_tr, y_tr_reg)
+            fold_pred_reg = reg_copy.predict(X_vl)
+            reg_mae_folds.append(mean_absolute_error(y_vl_reg, fold_pred_reg))
+            reg_rmse_folds.append(mean_squared_error(y_vl_reg, fold_pred_reg)**0.5)
+            reg_r2_folds.append(r2_score(y_vl_reg, fold_pred_reg))
+
+            # Classification fold
+            clf_copy = pkl.loads(pkl.dumps(classifier))
+            clf_copy.fit(X_tr, y_tr_clf)
+            fold_pred_clf   = clf_copy.predict(X_vl)
+            fold_proba_clf  = (clf_copy.predict_proba(X_vl)[:, 1]
+                               if hasattr(clf_copy, "predict_proba")
+                               else fold_pred_clf.astype(float))
+
+            clf_acc_folds.append(accuracy_score(y_vl_clf, fold_pred_clf))
+            clf_f1_folds.append( f1_score(y_vl_clf, fold_pred_clf, zero_division=0))
+
+            if len(np.unique(y_vl_clf)) > 1:
+                clf_auc_folds.append(roc_auc_score(y_vl_clf, fold_proba_clf))
+            else:
+                log.warning(f"  {race} val fold has only one class — AUC skipped")
+
+            log.info(f"  {race}: reg_mae={reg_mae_folds[-1]:.4f}  "
+                     f"clf_f1={clf_f1_folds[-1]:.4f}")
+
+        reg_mae_arr  = np.array(reg_mae_folds)
+        reg_rmse_arr = np.array(reg_rmse_folds)
+        reg_r2_arr   = np.array(reg_r2_folds)
+        clf_acc_arr  = np.array(clf_acc_folds)
+        clf_f1_arr   = np.array(clf_f1_folds)
+        clf_auc_arr  = np.array(clf_auc_folds) if clf_auc_folds else np.array([0.0])
+
+        log.info(f"\n  Regressor  Chrono-CV MAE  : "
+                 f"{reg_mae_arr.mean():.4f} ± {reg_mae_arr.std():.4f}")
+        log.info(f"  Regressor  Chrono-CV RMSE : "
+                 f"{reg_rmse_arr.mean():.4f} ± {reg_rmse_arr.std():.4f}")
+        log.info(f"  Regressor  Chrono-CV R2   : "
+                 f"{reg_r2_arr.mean():.4f} ± {reg_r2_arr.std():.4f}")
+        log.info(f"  Classifier Chrono-CV Acc  : "
+                 f"{clf_acc_arr.mean():.4f} ± {clf_acc_arr.std():.4f}")
+        log.info(f"  Classifier Chrono-CV F1   : "
+                 f"{clf_f1_arr.mean():.4f} ± {clf_f1_arr.std():.4f}")
+        log.info(f"  Classifier Chrono-CV AUC  : "
+                 f"{clf_auc_arr.mean():.4f} ± {clf_auc_arr.std():.4f}")
 
         return {
-            "reg_cv_mae"  : reg_mae_scores,
-            "reg_cv_rmse" : reg_rmse_scores,
-            "reg_cv_r2"   : reg_r2_scores,
-            "clf_cv_acc"  : clf_acc_scores,
-            "clf_cv_f1"   : clf_f1_scores,
-            "clf_cv_auc"  : clf_auc_scores,
+            "reg_cv_mae"  : reg_mae_arr,
+            "reg_cv_rmse" : reg_rmse_arr,
+            "reg_cv_r2"   : reg_r2_arr,
+            "clf_cv_acc"  : clf_acc_arr,
+            "clf_cv_f1"   : clf_f1_arr,
+            "clf_cv_auc"  : clf_auc_arr,
         }
 
     except Exception as e:
         raise CustomException(e, sys)
-
+    
 
 # ─────────────────────────────────────────
 # SECTION 3 — DETAILED VAL SET DIAGNOSTICS
@@ -225,6 +283,18 @@ def detailed_val_diagnostics(regressor, classifier,
             log.info(f"\n{wrong.to_string(index=False)}")
         else:
             log.info("  None — perfect classification on val.")
+
+        # ── Per-race breakdown ──
+        log.info(f"\n  Per-race val metrics:")
+        log.info(f"  {'Race':<12} {'MAE':>8} {'Acc':>8} {'N':>5}")
+        log.info(f"  {'-'*37}")
+        for race in val_df["Race"].unique():
+            mask     = val_df["Race"].values == race
+            if mask.sum() == 0:
+                continue
+            race_mae = mean_absolute_error(y_val_reg[mask], reg_pred[mask])
+            race_acc = accuracy_score(y_val_clf[mask], clf_pred[mask])
+            log.info(f"  {race:<12} {race_mae:>8.4f} {race_acc:>8.4f} {mask.sum():>5}")
 
         return val_with_pred
 
@@ -377,8 +447,9 @@ def run_validation():
 
         # Section 2 — Cross validation
         cv_results = cross_validate_models(
-            regressor, classifier, X_train, y_train_reg, y_train_clf
+            regressor, classifier, X_train, y_train_reg, y_train_clf, train
         )
+            
 
         # Section 3 — Detailed val diagnostics
         val_with_pred = detailed_val_diagnostics(

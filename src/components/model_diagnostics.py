@@ -24,36 +24,42 @@ from src.config import (
     ARTIFACTS_DIR,
     TARGET_REGRESSION, TARGET_CLASSIFICATION
 )
+import warnings
+warnings.filterwarnings('ignore')
+
 
 
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
     "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
+    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
     "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
     "VER_avg_entry_speed", "HAM_avg_entry_speed",
     "VER_TyreLife", "HAM_TyreLife",
+    "VER_stint_phase", "HAM_stint_phase",
     "same_compound", "VER_compound_enc", "HAM_compound_enc",
     "LapNumber", "race_enc"
 ]
 
 FEATURE_LABELS = [
-    "Coasting % Delta",         "Full Throttle % Delta",   "Gear Shifts Delta",
-    "Brake Zone Length Delta",  "Entry Speed Delta",        "Brake Zone Count Delta",
+    "Coasting % Delta",         "Full Throttle % Delta",    "Gear Shifts Delta",
+    "Brake Zone Length Delta",  "Entry Speed Delta",         "Brake Zone Count Delta",
     "Tyre Life Delta",          "TyreLife x Coasting Delta",
+    "Stint Phase Delta",        "AbuDhabi Gear Delta",       "Rolling Delta 3",
     "VER Coasting %",           "HAM Coasting %",
     "VER Full Throttle %",      "HAM Full Throttle %",
     "VER Gear Shifts",          "HAM Gear Shifts",
     "VER Brake Zone Length",    "HAM Brake Zone Length",
     "VER Entry Speed",          "HAM Entry Speed",
     "VER Tyre Life",            "HAM Tyre Life",
-    "Same Compound",            "VER Compound",            "HAM Compound",
+    "VER Stint Phase",          "HAM Stint Phase",
+    "Same Compound",            "VER Compound",              "HAM Compound",
     "Lap Number",               "Race"
 ]
-
 
 def save_fig(fig, filename):
     path = os.path.join(ARTIFACTS_DIR, filename)
@@ -143,6 +149,8 @@ def plot_residuals(reg, X_val, y_val_reg, val_df):
         pred      = reg.predict(X_val)
         residuals = y_val_reg - pred
 
+        
+
         fig, axes = plt.subplots(1, 3, figsize=(16, 5))
         fig.suptitle("Regression Residual Diagnostics (Val Set)", fontsize=13)
 
@@ -158,23 +166,31 @@ def plot_residuals(reg, X_val, y_val_reg, val_df):
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # Residuals vs Predicted
+        # Residuals vs Predicted — coloured by same_compound
+        # This directly tests whether large residuals cluster in compound-mismatch laps
         ax = axes[1]
-        ax.scatter(pred, residuals, color="#15803D", alpha=0.7, s=40)
+        same_mask = val_df["same_compound"].values > 0.5
+
+        ax.scatter(pred[same_mask],  residuals[same_mask],
+                   color="#15803D", alpha=0.8, s=50, label="Same compound")
+        ax.scatter(pred[~same_mask], residuals[~same_mask],
+                   color="#DC2626", alpha=0.8, s=50, label="Diff compound",
+                   marker="^")
         ax.axhline(0, color="red", linestyle="--", linewidth=1)
         ax.set_xlabel("Predicted Delta (s)")
         ax.set_ylabel("Residual (Actual - Predicted)")
-        ax.set_title("Residuals vs Predicted")
+        ax.set_title("Residuals vs Predicted\n(coloured by compound match)")
+        ax.legend()
         ax.grid(True, alpha=0.3)
 
         # Residuals by Race
         ax = axes[2]
         colors_race = {"Bahrain": "#1E3A8A", "Spain": "#15803D", "AbuDhabi": "#B45309"}
         for race in val_df["Race"].unique():
-            mask = val_df["Race"] == race
+            mask = val_df["Race"].values == race
             ax.scatter(
                 val_df.loc[mask, "LapNumber"],
-                residuals[mask.values],
+                residuals[mask],
                 label=race,
                 color=colors_race.get(race, "gray"),
                 alpha=0.8, s=40
@@ -188,14 +204,23 @@ def plot_residuals(reg, X_val, y_val_reg, val_df):
 
         save_fig(fig, "07_residual_diagnostics.png")
 
-        # Log summary
         log.info(f"  Residual mean  = {residuals.mean():.4f}s  (bias)")
         log.info(f"  Residual std   = {residuals.std():.4f}s")
         log.info(f"  Max error      = {abs(residuals).max():.4f}s")
 
+        # Key finding: are large residuals in compound-mismatch laps?
+        if same_mask.sum() > 0 and (~same_mask).sum() > 0:
+            same_mae = mean_absolute_error(y_val_reg[same_mask],  pred[same_mask])
+            diff_mae  = mean_absolute_error(y_val_reg[~same_mask], pred[~same_mask])
+            log.info(f"\n  MAE by compound match:")
+            log.info(f"    Same compound laps : {same_mae:.4f}s")
+            log.info(f"    Diff compound laps : {diff_mae:.4f}s")
+            log.info(f"    Ratio (diff/same)  : {diff_mae/same_mae:.2f}x worse on diff compound")
+        else:
+            log.info(f"\n  MAE by compound match: skipped — one group has 0 samples in val set")
+        
     except Exception as e:
         raise CustomException(e, sys)
-
 
 # ─────────────────────────────────────────
 # PLOT 3 — CONFUSION MATRIX + ROC CURVE

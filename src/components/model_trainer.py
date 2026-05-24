@@ -14,6 +14,9 @@ from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score
 )
 from xgboost import XGBRegressor, XGBClassifier
+from sklearn.linear_model import (LinearRegression, LogisticRegression,
+                                   RidgeCV, LassoCV)
+from lightgbm import LGBMRegressor, LGBMClassifier
 
 from src.logger import logging as log
 from src.exception import CustomException
@@ -25,22 +28,27 @@ from src.config import (
     TARGET_REGRESSION, TARGET_CLASSIFICATION,
     INITIAL_MODEL_PARAMS
 )
+import warnings
+warnings.filterwarnings('ignore')
 
+
+#-----------------------------------------------------------------------------------------------------------------------------------------
 
 FEATURE_COLS = [
     "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
     "avg_brake_zone_length_delta", "avg_entry_speed_delta",
     "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
+    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
     "VER_coasting_pct", "HAM_coasting_pct",
     "VER_full_throttle_pct", "HAM_full_throttle_pct",
     "VER_gear_shifts", "HAM_gear_shifts",
     "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
     "VER_avg_entry_speed", "HAM_avg_entry_speed",
     "VER_TyreLife", "HAM_TyreLife",
+    "VER_stint_phase", "HAM_stint_phase",
     "same_compound", "VER_compound_enc", "HAM_compound_enc",
     "LapNumber", "race_enc"
 ]
-
 
 # ─────────────────────────────────────────
 # LOAD SPLITS
@@ -142,11 +150,27 @@ def train_regressors(X_train, y_train, X_val, y_val):
         lr = LinearRegression()
         lr.fit(X_train, y_train)
         results.append(eval_regressor(lr, X_val, y_val, "LinearRegression"))
+        cv_lr = cross_val_score(lr, X_train, y_train,
+                                cv=5, scoring="neg_mean_absolute_error")
+        log.info(f"  [LinearRegression] CV MAE: {-cv_lr.mean():.4f} ± {cv_lr.std():.4f}")
 
-        # Cross-val on train for LinearRegression
-        cv_scores = cross_val_score(lr, X_train, y_train,
-                                    cv=5, scoring="neg_mean_absolute_error")
-        log.info(f"  [LinearRegression] CV MAE: {-cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+        # ── RidgeCV — addresses LinearRegression CV instability ──
+        ridge = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0], cv=5)
+        ridge.fit(X_train, y_train)
+        log.info(f"  RidgeCV selected alpha: {ridge.alpha_}")
+        results.append(eval_regressor(ridge, X_val, y_val, "RidgeCV"))
+        cv_ridge = cross_val_score(ridge, X_train, y_train,
+                                   cv=5, scoring="neg_mean_absolute_error")
+        log.info(f"  [RidgeCV] CV MAE: {-cv_ridge.mean():.4f} ± {cv_ridge.std():.4f}")
+
+        # ── LassoCV — feature selection through sparsity ──
+        lasso = LassoCV(alphas=[0.001, 0.01, 0.1, 1.0], cv=5,
+                        max_iter=5000, random_state=42)
+        lasso.fit(X_train, y_train)
+        n_zero = (lasso.coef_ == 0).sum()
+        log.info(f"  LassoCV selected alpha: {lasso.alpha_:.4f} | "
+                 f"zeroed features: {n_zero}/{len(lasso.coef_)}")
+        results.append(eval_regressor(lasso, X_val, y_val, "LassoCV"))
 
         # ── RandomForest ──
         rf_params = INITIAL_MODEL_PARAMS.get("regressor", {})
@@ -154,13 +178,12 @@ def train_regressors(X_train, y_train, X_val, y_val):
         rf.fit(X_train, y_train)
         results.append(eval_regressor(rf, X_val, y_val, "RandomForest-Initial"))
 
-        # ── RandomizedSearchCV on RandomForest ──
         log.info("  Running RandomizedSearchCV on RandomForest...")
         rf_param_grid = {
-            "n_estimators" : [50, 100, 200],
-            "max_depth"    : [3, 4, 5, 6, None],
+            "n_estimators"    : [50, 100, 200],
+            "max_depth"       : [3, 4, 5, 6, None],
             "min_samples_leaf": [2, 5, 8, 10],
-            "max_features" : ["sqrt", "log2", 0.5],
+            "max_features"    : ["sqrt", "log2", 0.5],
         }
         rf_search = RandomizedSearchCV(
             RandomForestRegressor(random_state=42),
@@ -195,31 +218,61 @@ def train_regressors(X_train, y_train, X_val, y_val):
         log.info(f"  XGB best params: {xgb_search.best_params_}")
         results.append(eval_regressor(best_xgb, X_val, y_val, "XGBoost-Tuned"))
 
-        # ── Pick best by MAE on val ──
-        best_result = min(results[1:], key=lambda x: x["MAE"])  # skip dummy
+        # ── LightGBM — better regularisation for small datasets ──
+        log.info("  Running RandomizedSearchCV on LightGBM...")
+        lgbm_param_grid = {
+            "n_estimators"    : [50, 100, 200],
+            "max_depth"       : [3, 4, 5, 6],
+            "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
+            "num_leaves"      : [15, 31, 63],
+            "min_child_samples": [5, 10, 15, 20],
+            "subsample"       : [0.6, 0.8, 1.0],
+            "reg_alpha"       : [0, 0.1, 0.5],
+        }
+        lgbm_search = RandomizedSearchCV(
+            LGBMRegressor(random_state=42, verbose=-1),
+            lgbm_param_grid, n_iter=20, cv=5,
+            scoring="neg_mean_absolute_error",
+            random_state=42, n_jobs=1
+        )
+        lgbm_search.fit(X_train, y_train)
+        best_lgbm = lgbm_search.best_estimator_
+        log.info(f"  LGBM best params: {lgbm_search.best_params_}")
+        results.append(eval_regressor(best_lgbm, X_val, y_val, "LightGBM-Tuned"))
+
+        # ── Pick best by MAE on val (skip dummy) ──
+        best_result = min(results[1:], key=lambda x: x["MAE"])
         log.info(f"\n  Best regressor on val: {best_result['label']} "
                  f"| MAE={best_result['MAE']:.4f}s")
 
-        # Map label to model object
         model_map = {
             "LinearRegression"    : lr,
+            "RidgeCV"             : ridge,
+            "LassoCV"             : lasso,
             "RandomForest-Initial": rf,
             "RandomForest-Tuned"  : best_rf,
             "XGBoost-Tuned"       : best_xgb,
+            "LightGBM-Tuned"      : best_lgbm,
         }
-        best_reg_model  = model_map[best_result["label"]]
-        best_reg_params = (rf_search.best_params_
-                           if "RandomForest" in best_result["label"]
-                           else xgb_search.best_params_
-                           if "XGBoost" in best_result["label"]
-                           else {})
+        best_reg_model = model_map[best_result["label"]]
 
+        if best_result["label"] in ["RandomForest-Tuned", "RandomForest-Initial"]:
+            best_reg_params = rf_search.best_params_
+        elif best_result["label"] == "XGBoost-Tuned":
+            best_reg_params = xgb_search.best_params_
+        elif best_result["label"] == "LightGBM-Tuned":
+            best_reg_params = lgbm_search.best_params_
+        elif best_result["label"] == "RidgeCV":
+            best_reg_params = {"alpha": ridge.alpha_}
+        elif best_result["label"] == "LassoCV":
+            best_reg_params = {"alpha": lasso.alpha_}
+        else:
+            best_reg_params = {}
 
         return best_reg_model, best_reg_params, results
 
     except Exception as e:
         raise CustomException(e, sys)
-
 
 # ─────────────────────────────────────────
 # CLASSIFICATION TRAINING

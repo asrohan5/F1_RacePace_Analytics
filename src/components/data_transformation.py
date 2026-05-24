@@ -223,27 +223,69 @@ def engineer_features(paired):
         df["brake_zone_count_delta"]     = df["VER_brake_zone_count"]     - df["HAM_brake_zone_count"]
         df["tyre_life_delta"]            = df["VER_TyreLife"]             - df["HAM_TyreLife"]
         
-        # ── Update after model_diagnostics: Tyre life interaction feature ──
-        # Captures whether VER's coasting advantage changes as tyre age difference grows
-        # High positive = VER coasts more AND has older tyres (style under pressure)
-        # High negative = VER coasts more BUT has fresher tyres (style on new rubber)
-        df["tyre_life_x_coasting_delta"] = df["tyre_life_delta"] * df["coasting_pct_delta"]
+        # ── Interaction feature — clipped to ±50 to remove outlier distortion ──
+        raw_interaction = df["tyre_life_delta"] * df["coasting_pct_delta"]
+        df["tyre_life_x_coasting_delta"]  = raw_interaction.clip(-50, 50)
+        log.info(f"  tyre_life_x_coasting_delta clipped: "
+                 f"raw range [{raw_interaction.min():.1f}, {raw_interaction.max():.1f}] "
+                 f"→ clipped [{df['tyre_life_x_coasting_delta'].min():.1f}, "
+                 f"{df['tyre_life_x_coasting_delta'].max():.1f}]")
 
-        # ── same_compound flag ──
-        df["same_compound"] = (df["VER_Compound"] == df["HAM_Compound"]).astype(int)
-
-        # ── Compound encoding (VER compound — reference driver) ──
-        compound_map = {"SOFT": 0, "MEDIUM": 1, "HARD": 2}
-        df["VER_compound_enc"] = df["VER_Compound"].map(compound_map).fillna(1).astype(int)
-        df["HAM_compound_enc"] = df["HAM_Compound"].map(compound_map).fillna(1).astype(int)
+        # ── NEW: Stint phase delta ──
+        # Tyre life as fraction of expected compound stint length
+        # Captures non-linear degradation: 0=fresh, 1=end of expected life, >1=overdue
+        stint_length_map = {"SOFT": 15, "MEDIUM": 25, "HARD": 40}
+        df["VER_stint_phase"] = (
+            df["VER_TyreLife"] /
+            df["VER_Compound"].map(stint_length_map).fillna(25)
+        )
+        df["HAM_stint_phase"] = (
+            df["HAM_TyreLife"] /
+            df["HAM_Compound"].map(stint_length_map).fillna(25)
+        )
+        df["stint_phase_delta"] = df["VER_stint_phase"] - df["HAM_stint_phase"]
 
         # ── Race encoding ──
         race_map = {"Bahrain": 0, "Spain": 1, "AbuDhabi": 2}
         df["race_enc"] = df["Race"].map(race_map)
 
+        # ── Compound encoding ──
+        compound_map = {"SOFT": 0, "MEDIUM": 1, "HARD": 2}
+        df["VER_compound_enc"] = df["VER_Compound"].map(compound_map).fillna(1).astype(int)
+        df["HAM_compound_enc"] = df["HAM_Compound"].map(compound_map).fillna(1).astype(int)
+
+
+        # ── same_compound flag ──
+        df["same_compound"] = (df["VER_Compound"] == df["HAM_Compound"]).astype(int)
+
         # ── Target variables ──
-        df[TARGET_REGRESSION]     = df["VER_LapTimeSec"] - df["HAM_LapTimeSec"]
-        df[TARGET_CLASSIFICATION] = (df[TARGET_REGRESSION] < 0).astype(int)
+        df[TARGET_REGRESSION]    = df["VER_LapTimeSec"] - df["HAM_LapTimeSec"]
+        df[TARGET_CLASSIFICATION]= (df[TARGET_REGRESSION] < 0).astype(int)
+
+
+        # ── NEW: Abu Dhabi gear shift interaction ──
+        # EDA showed VER vs HAM gear shift gap was largest in Abu Dhabi (39.9 vs 35.7)
+        # This interaction lets the model learn Abu Dhabi-specific gear shift effects
+        df["abu_dhabi_gear_delta"] = (
+            df["gear_shifts_delta"] * (df["race_enc"] == 2).astype(int)
+        )
+
+        # ── NEW: Rolling 3-lap delta (temporal momentum) ──
+        # Consecutive laps are correlated — fuel load decreases, track rubbers in
+        # Fill NaN (first 3 laps of each race) with 0 = neutral assumption
+        df_sorted = df.sort_values(["Race", "LapNumber"]).copy()
+        df_sorted["rolling_delta_3"] = (
+            df_sorted.groupby("Race")[TARGET_REGRESSION]
+            .transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+            .fillna(0)
+        )
+        # Merge back to preserve original order
+        df["rolling_delta_3"] = df_sorted["rolling_delta_3"].values
+
+        log.info(f"  rolling_delta_3: mean={df['rolling_delta_3'].mean():.3f}  "
+                 f"std={df['rolling_delta_3'].std():.3f}  "
+                 f"zeros(first laps)={(df['rolling_delta_3']==0).sum()}")
+
 
         log.info(f"Features engineered. Final shape: {df.shape}")
         log.info(f"Target regression   — mean={df[TARGET_REGRESSION].mean():.3f}s  "
@@ -262,11 +304,6 @@ def engineer_features(paired):
 # ─────────────────────────────────────────
 
 def get_feature_columns():
-    """
-    Returns the ordered list of feature columns used for modelling.
-    Keeping individual VER/HAM features alongside delta features
-    gives the model both absolute and relative information.
-    """
     features = [
         # Delta features — primary signal
         "coasting_pct_delta",
@@ -276,10 +313,14 @@ def get_feature_columns():
         "avg_entry_speed_delta",
         "brake_zone_count_delta",
         "tyre_life_delta",
-        
-        "tyre_life_x_coasting_delta",
+        "tyre_life_x_coasting_delta",  # clipped ±50
 
-        # Individual driver features — context
+        # NEW features
+        "stint_phase_delta",            # non-linear tyre degradation
+        "abu_dhabi_gear_delta",         # race-specific gear interaction
+        "rolling_delta_3",              # 3-lap temporal momentum
+
+        # Individual driver features
         "VER_coasting_pct",
         "HAM_coasting_pct",
         "VER_full_throttle_pct",
@@ -292,8 +333,10 @@ def get_feature_columns():
         "HAM_avg_entry_speed",
         "VER_TyreLife",
         "HAM_TyreLife",
+        "VER_stint_phase",              # absolute stint phase per driver
+        "HAM_stint_phase",
 
-        # Contextual features
+        # Contextual
         "same_compound",
         "VER_compound_enc",
         "HAM_compound_enc",
@@ -301,7 +344,6 @@ def get_feature_columns():
         "race_enc",
     ]
     return features
-
 
 # ─────────────────────────────────────────
 # STEP 7 — TRAIN / VAL / TEST SPLIT
@@ -379,6 +421,8 @@ def scale_features(train_df, val_df, test_df, feature_cols):
 
     except Exception as e:
         raise CustomException(e, sys)
+
+
 
 
 # ─────────────────────────────────────────
