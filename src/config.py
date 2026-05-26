@@ -3,7 +3,7 @@ import os
 # ─────────────────────────────────────────
 # BASE PATHS
 # ─────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.getcwd()
 
 DATA_RAW_DIR       = os.path.join(BASE_DIR, "data", "raw")
 DATA_PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
@@ -22,6 +22,7 @@ for _dir in [DATA_RAW_DIR, DATA_PROCESSED_DIR, DATA_SPLITS_DIR,
 # ─────────────────────────────────────────
 LAPS_RAW_PATH      = os.path.join(DATA_RAW_DIR, "laps_raw.csv")
 TELEMETRY_RAW_PATH = os.path.join(DATA_RAW_DIR, "telemetry_raw.parquet")
+RACE_METADATA_PATH = os.path.join(DATA_RAW_DIR, "race_metadata.csv")
 
 # ─────────────────────────────────────────
 # PROCESSED DATA FILE PATHS
@@ -188,7 +189,20 @@ VAL_ROUNDS     = {19, 20}
 # Note: Monaco excluded from training due to unique circuit characteristics
 # that would add noise rather than signal (street circuit, no meaningful
 # lap-time delta comparison due to traffic and safety car periods)
-EXCLUDE_ROUNDS = {5}   # Monaco
+
+# Rounds excluded from ALL analysis
+EXCLUDE_ROUNDS = {5}     # Monaco — street circuit, unrepresentative lap times
+
+# Rounds excluded from VER vs HAM paired analysis only
+# (one or both primary drivers did not complete meaningful laps)
+EXCLUDE_FROM_PAIRING = {10}    # Britain — VER lap 1 retirement
+
+# Rounds where teammate normalisation is unreliable
+# (teammate did not complete enough laps for style metrics)
+EXCLUDE_FROM_TEAMMATE = {11, 21}  # Hungary (BOT+PER out), SaudiArabia (PER only 9 laps)
+
+# Rounds to flag as low-sample — include but monitor
+LOW_SAMPLE_ROUNDS = {2, 14}   # Imola (sprint format), Italy (incidents)
 
 # ─────────────────────────────────────────
 # TARGET COLUMNS
