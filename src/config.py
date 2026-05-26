@@ -265,7 +265,6 @@ if __name__ == "__main__":
     log.info(f"All drivers  : {ALL_DRIVERS}")
     log.info(f"Test race    : {TEST_RACE} (Round {TEST_ROUND})")
     log.info(f"Val races    : {VAL_RACES}")
-    log.info(f"Excluded     : Monaco (Round 5) — street circuit noise")
     log.info(f"Training races: {len(RACES) - 1 - len(VAL_RACES) - len(EXCLUDE_ROUNDS)}"
              f" rounds")
 
@@ -276,3 +275,31 @@ if __name__ == "__main__":
         delta = get_upgrade_delta(rnd)
         log.info(f"  R{rnd:>2} {label:<15} VER_level={ver_f} HAM_level={ham_f} "
                  f"delta={delta:+d}")
+    
+    log.info("\nExclusion summary:")
+    log.info(f"  Excluded entirely        : {EXCLUDE_ROUNDS} (Monaco)")
+    log.info(f"  Excluded from pairing    : {EXCLUDE_FROM_PAIRING} "
+            f"(Britain=lap1, Hungary=incident, Russia=penalty)")
+    log.info(f"  Excluded from SC model   : {EXCLUDE_FROM_SC} "
+            f"(Italy=0%SC, Russia=0%SC, SaudiArabia=28%SC)")
+    log.info(f"  Excluded from teammate   : {EXCLUDE_FROM_TEAMMATE} "
+            f"(Hungary=PER+BOT out, SaudiArabia=PER 9 laps)")
+    log.info(f"  Low sample rounds        : {LOW_SAMPLE_ROUNDS} "
+            f"(Imola=sprint, Italy=incidents, SaudiArabia=chaos)")
+
+    log.info("\nEffective training races after all exclusions:")
+    excluded_all = EXCLUDE_ROUNDS | EXCLUDE_FROM_PAIRING | {TEST_ROUND} | set(
+        rnd for rnd, _ in RACES if _ in VAL_RACES
+    )
+    for rnd, label in RACES:
+        if rnd in excluded_all:
+            status = "EXCLUDED"
+        elif rnd == TEST_ROUND:
+            status = "TEST"
+        elif label in VAL_RACES:
+            status = "VAL"
+        elif rnd in LOW_SAMPLE_ROUNDS:
+            status = "TRAIN (low sample)"
+        else:
+            status = "TRAIN"
+        log.info(f"  R{rnd:>2} {label:<15} → {status}")
