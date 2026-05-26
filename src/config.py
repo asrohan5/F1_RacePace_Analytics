@@ -193,16 +193,36 @@ VAL_ROUNDS     = {19, 20}
 # Rounds excluded from ALL analysis
 EXCLUDE_ROUNDS = {5}     # Monaco — street circuit, unrepresentative lap times
 
+
+
 # Rounds excluded from VER vs HAM paired analysis only
 # (one or both primary drivers did not complete meaningful laps)
-EXCLUDE_FROM_PAIRING = {10}    # Britain — VER lap 1 retirement
+EXCLUDE_FROM_PAIRING = {10, 11, 15}
+# Britain (R10) — VER lap 1 retirement
+# Hungary (R11) — VER rejoined last after lap 1 incident, unrepresentative laps
+# Russia  (R15) — VER grid penalty + strategic pit, unrepresentative deltas
+
+
+
 
 # Rounds where teammate normalisation is unreliable
 # (teammate did not complete enough laps for style metrics)
 EXCLUDE_FROM_TEAMMATE = {11, 21}  # Hungary (BOT+PER out), SaudiArabia (PER only 9 laps)
 
+
+EXCLUDE_FROM_SC = {14, 15, 21}
+# Italy (R14)      — 0% same compound
+# Russia (R15)     — 0% same compound
+# SaudiArabia (R21)— 28% same compound (below threshold)
+
+
 # Rounds to flag as low-sample — include but monitor
-LOW_SAMPLE_ROUNDS = {2, 14}   # Imola (sprint format), Italy (incidents)
+LOW_SAMPLE_ROUNDS = {2, 14, 21}
+# Imola (R2)       — sprint format + BOT incident
+# Italy (R14)      — incidents, 0% same compound
+# SaudiArabia (R21)— 28% same compound, chaotic race
+
+
 
 # ─────────────────────────────────────────
 # TARGET COLUMNS
@@ -211,9 +231,21 @@ TARGET_REGRESSION     = "lap_time_delta_sec"
 TARGET_CLASSIFICATION = "ver_faster"
 
 # ─────────────────────────────────────────
-# HYPERPARAMETERS (empty — populated after EDA)
+# HYPERPARAMETERS (populated after EDA)
 # ─────────────────────────────────────────
-INITIAL_MODEL_PARAMS = {}
+INITIAL_MODEL_PARAMS = {
+    "regressor": {
+        "n_estimators"    : 100,
+        "max_depth"       : 5,
+        "min_samples_leaf": 8,
+        "random_state"    : 42
+    },
+    "classifier": {
+        "C"          : 1.0,
+        "max_iter"   : 1000,
+        "random_state": 42
+    }
+}
 
 # ─────────────────────────────────────────
 # BEST PARAMS (auto-populated by model_trainer.py)

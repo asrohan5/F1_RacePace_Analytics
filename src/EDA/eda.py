@@ -3,22 +3,26 @@ import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 from src.logger import logging as log
 from src.exception import CustomException
-
 from src.config import (
     LAPS_RAW_PATH, TELEMETRY_RAW_PATH, ARTIFACTS_DIR,
+    RACE_METADATA_PATH,
     THROTTLE_OFF_THRESHOLD, FULL_THROTTLE_THRESHOLD,
-    MIN_BRAKE_ZONE_LENGTH_M, DRIVERS,
-    CACHE_DIR, SEASON, RACES, SESSION_TYPE
+    MIN_BRAKE_ZONE_LENGTH_M,
+    DRIVERS, ALL_DRIVERS, TEAMMATE_PAIRS,
+    EXCLUDE_ROUNDS, EXCLUDE_FROM_PAIRING, EXCLUDE_FROM_TEAMMATE,
+    LOW_SAMPLE_ROUNDS,
+    STINT_LENGTH_MAP,
+    TEST_RACE, VAL_RACES,
 )
 
 
-# ─────────────────────────────────────────
-# HELPER — save figure
-# ─────────────────────────────────────────
+
+COLORS = {"VER": "#1E3A8A", "HAM": "#15803D",
+          "PER": "#7C3AED", "BOT": "#B45309"}
+
 
 def save_fig(fig, filename):
     path = os.path.join(ARTIFACTS_DIR, filename)
@@ -28,727 +32,538 @@ def save_fig(fig, filename):
 
 
 # ─────────────────────────────────────────
-# LOAD DATA
+# LOAD
 # ─────────────────────────────────────────
 
 def load_data():
     try:
         laps = pd.read_csv(LAPS_RAW_PATH)
-        tel  = pd.read_parquet(TELEMETRY_RAW_PATH)
+        meta = pd.read_csv(RACE_METADATA_PATH)
         log.info(f"Laps loaded      : {laps.shape}")
-        log.info(f"Telemetry loaded : {tel.shape}")
-        return laps, tel
+        log.info(f"Metadata loaded  : {meta.shape}")
+        return laps, meta
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# SECTION 1 — LAPS: distributions, compound, degradation, track status
+# SECTION 1 — DATA QUALITY AT SCALE
+# How many usable paired laps per race after exclusions?
 # ─────────────────────────────────────────
 
-def eda_laps(laps):
+def eda_data_quality(laps, meta):
     try:
         log.info("=" * 60)
-        log.info("SECTION 1 — Laps EDA")
+        log.info("SECTION 1 — Data Quality at Scale")
         log.info("=" * 60)
 
-        races   = laps["Race"].unique()
-        drivers = laps["Driver"].unique()
-        colors  = {"VER": "#1E3A8A", "HAM": "#15803D"}
+        # Green flag laps only
+        green = laps[laps["TrackStatus"] == 1].copy()
+        dropped = len(laps) - len(green)
+        log.info(f"Green flag filter: {len(laps)} → {len(green)} laps "
+                 f"(dropped {dropped} non-green, "
+                 f"{100*dropped/len(laps):.1f}%)")
 
-        # ── 1a: Lap time distribution per driver per race ──
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4), sharey=False)
-        fig.suptitle("Lap Time Distribution per Driver per Race", fontsize=13)
+        # Laps per driver per race
+        counts = green.groupby(["Race", "Driver"]).size().unstack(fill_value=0)
+        log.info(f"\nLaps per driver per race (green flag only):\n{counts.to_string()}")
 
-        for i, race in enumerate(races):
-            ax = axes[i]
-            for driver in drivers:
-                data = laps[(laps["Race"] == race) & (laps["Driver"] == driver)]["LapTimeSec"]
-                ax.hist(data, bins=15, alpha=0.6, label=driver, color=colors[driver])
-                log.info(f"  {race} | {driver} | mean={data.mean():.3f}s  std={data.std():.3f}s  "
-                         f"min={data.min():.3f}s  max={data.max():.3f}s  count={len(data)}")
-            ax.set_title(race)
-            ax.set_xlabel("Lap Time (s)")
-            ax.set_ylabel("Count")
-            ax.legend()
+        # Identify races where VER or HAM has fewer than 10 clean laps
+        ver_sparse = counts[counts.get("VER", 0) < 10].index.tolist()
+        ham_sparse = counts[counts.get("HAM", 0) < 10].index.tolist()
+        log.info(f"\nRaces with VER < 10 clean laps: {ver_sparse}")
+        log.info(f"Races with HAM < 10 clean laps: {ham_sparse}")
 
-        save_fig(fig, "01a_laptime_distribution.png")
+        # Paired lap count per race (inner join VER + HAM on LapNumber)
+        ver_laps = green[green["Driver"] == "VER"][["Race", "LapNumber", "RoundNumber"]]
+        ham_laps = green[green["Driver"] == "HAM"][["Race", "LapNumber"]]
+        paired   = ver_laps.merge(ham_laps, on=["Race", "LapNumber"], how="inner")
 
-        # ── 1b: Tyre compound usage per driver per race ──
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4))
-        fig.suptitle("Tyre Compound Usage per Driver per Race", fontsize=13)
+        # Remove excluded pairing rounds
+        paired = paired[~paired["RoundNumber"].isin(EXCLUDE_FROM_PAIRING)]
 
-        for i, race in enumerate(races):
-            ax = axes[i]
-            race_laps = laps[laps["Race"] == race]
-            compound_counts = race_laps.groupby(["Driver", "Compound"]).size().unstack(fill_value=0)
-            compound_counts.plot(kind="bar", ax=ax, legend=(i == 0))
-            ax.set_title(race)
-            ax.set_xlabel("")
-            ax.set_ylabel("Lap Count")
-            ax.tick_params(axis="x", rotation=0)
-            log.info(f"  {race} compound counts:\n{compound_counts.to_string()}")
+        paired_counts = paired.groupby("Race").size().reset_index(name="PairedLaps")
+        log.info(f"\nPaired laps per race (after exclusions):")
+        log.info(f"\n{paired_counts.to_string(index=False)}")
+        log.info(f"\nTotal usable paired laps: {len(paired)}")
+        log.info(f"(Phase 1 had 138 — Phase 2 has {len(paired)})")
 
-        save_fig(fig, "01b_compound_usage.png")
+        # Plot paired lap counts per race
+        fig, ax = plt.subplots(figsize=(14, 5))
+        races_sorted = paired_counts.sort_values("PairedLaps", ascending=False)
+        colors = ["#DC2626" if r in [TEST_RACE] else
+                  "#F59E0B" if r in VAL_RACES else
+                  "#1E3A8A"
+                  for r in races_sorted["Race"]]
+        ax.bar(races_sorted["Race"], races_sorted["PairedLaps"], color=colors)
+        ax.set_xlabel("Race")
+        ax.set_ylabel("Paired Laps (VER + HAM, same lap number)")
+        ax.set_title("Usable Paired Laps per Race\n"
+                     "(Blue=Train, Orange=Val, Red=Test)")
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(True, alpha=0.3, axis="y")
 
-        # ── 1c: Tyre life vs lap time (degradation) per driver per race ──
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4))
-        fig.suptitle("Tyre Life vs Lap Time (Degradation)", fontsize=13)
+        # Add legend
+        from matplotlib.patches import Patch
+        legend = [Patch(color="#1E3A8A", label="Train"),
+                  Patch(color="#F59E0B", label="Val"),
+                  Patch(color="#DC2626", label="Test")]
+        ax.legend(handles=legend)
+        save_fig(fig, "p2_01_paired_laps_per_race.png")
 
-        for i, race in enumerate(races):
-            ax = axes[i]
-            for driver in drivers:
-                data = laps[(laps["Race"] == race) & (laps["Driver"] == driver)]
-                ax.scatter(data["TyreLife"], data["LapTimeSec"],
-                           alpha=0.6, label=driver, color=colors[driver], s=20)
-            ax.set_title(race)
-            ax.set_xlabel("Tyre Life (laps)")
-            ax.set_ylabel("Lap Time (s)")
-            ax.legend()
-
-        save_fig(fig, "01c_tyre_degradation.png")
-
-        # ── 1d: Track status value counts ──
-        log.info("\n  Track Status value counts (1=green, 2=yellow, 4=SC, 5=red, 6=VSC):")
-        status_counts = laps.groupby(["Race", "TrackStatus"]).size().reset_index(name="count")
-        log.info(f"\n{status_counts.to_string(index=False)}")
-
-        non_green = laps[laps["TrackStatus"] != 1]
-        log.info(f"\n  Non-green flag laps: {len(non_green)} out of {len(laps)} total "
-                 f"({100 * len(non_green) / len(laps):.1f}%)")
-
-        fig, ax = plt.subplots(figsize=(8, 4))
-        status_counts_pivot = status_counts.pivot(index="Race", columns="TrackStatus", values="count").fillna(0)
-        status_counts_pivot.plot(kind="bar", ax=ax)
-        ax.set_title("Track Status Distribution per Race")
-        ax.set_xlabel("")
-        ax.set_ylabel("Lap Count")
-        ax.tick_params(axis="x", rotation=0)
-        save_fig(fig, "01d_track_status.png")
+        return green, paired
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# SECTION 2 — TELEMETRY: Distance alignment + samples per lap
+# SECTION 2 — LAP TIME DELTA AT SCALE
+# Is the target variable well-behaved across all 21 races?
 # ─────────────────────────────────────────
 
-def eda_telemetry_alignment(tel):
+def eda_lap_delta(laps, meta):
     try:
         log.info("=" * 60)
-        log.info("SECTION 2 — Telemetry Distance Alignment")
+        log.info("SECTION 2 — Lap Time Delta Across All Races")
         log.info("=" * 60)
 
-        # Samples per lap per driver per race
-        samples_per_lap = (
-            tel.groupby(["Race", "Driver", "LapNumber"])
-            .size()
-            .reset_index(name="SampleCount")
-        )
+        green = laps[laps["TrackStatus"] == 1].copy()
 
-        for race in tel["Race"].unique():
-            for driver in DRIVERS:
-                subset = samples_per_lap[
-                    (samples_per_lap["Race"] == race) &
-                    (samples_per_lap["Driver"] == driver)
-                ]["SampleCount"]
-                log.info(f"  {race} | {driver} | samples/lap — "
-                         f"mean={subset.mean():.1f}  min={subset.min()}  max={subset.max()}")
+        ver = green[green["Driver"] == "VER"][["Race", "RoundNumber",
+                                               "LapNumber", "LapTimeSec",
+                                               "Compound", "TyreLife"]].copy()
+        ham = green[green["Driver"] == "HAM"][["Race", "LapNumber",
+                                               "LapTimeSec", "Compound",
+                                               "TyreLife"]].copy()
 
-        # Flag laps with very few samples (less than 50% of median)
-        median_samples = samples_per_lap["SampleCount"].median()
-        thin_laps = samples_per_lap[samples_per_lap["SampleCount"] < median_samples * 0.5]
-        log.info(f"\n  Median samples/lap: {median_samples:.0f}")
-        log.info(f"  Laps with < 50% of median samples: {len(thin_laps)}")
-        if len(thin_laps) > 0:
-            log.info(f"\n{thin_laps.to_string(index=False)}")
+        ver.columns = ["Race", "RoundNumber", "LapNumber", "VER_LapTime",
+                       "VER_Compound", "VER_TyreLife"]
+        ham.columns = ["Race", "LapNumber", "HAM_LapTime",
+                       "HAM_Compound", "HAM_TyreLife"]
 
-        # Distance range per lap
-        dist_stats = (
-            tel.groupby(["Race", "Driver", "LapNumber"])["Distance"]
-            .agg(["min", "max"])
-            .reset_index()
-        )
-        dist_stats["range"] = dist_stats["max"] - dist_stats["min"]
+        delta = ver.merge(ham, on=["Race", "LapNumber"], how="inner")
+        delta = delta.merge(meta[["Race", "upgrade_delta"]], on="Race", how="left")
 
-        for race in tel["Race"].unique():
-            subset = dist_stats[dist_stats["Race"] == race]["range"]
-            log.info(f"\n  {race} | Distance range/lap — "
-                     f"mean={subset.mean():.1f}m  min={subset.min():.1f}m  max={subset.max():.1f}m")
+        # Remove excluded races
+        excluded_races = laps[laps["RoundNumber"].isin(
+            EXCLUDE_FROM_PAIRING)]["Race"].unique()
+        delta = delta[~delta["Race"].isin(excluded_races)]
 
-        # Plot samples per lap
-        fig, axes = plt.subplots(1, len(tel["Race"].unique()), figsize=(15, 4))
-        fig.suptitle("Telemetry Samples per Lap per Driver", fontsize=13)
-        colors = {"VER": "#1E3A8A", "HAM": "#15803D"}
+        delta["LapTimeDelta"] = delta["VER_LapTime"] - delta["HAM_LapTime"]
+        delta["VER_Faster"]   = (delta["LapTimeDelta"] < 0).astype(int)
+        delta["SameCompound"] = (delta["VER_Compound"] == delta["HAM_Compound"]).astype(int)
 
-        for i, race in enumerate(tel["Race"].unique()):
-            ax = axes[i]
-            for driver in DRIVERS:
-                subset = samples_per_lap[
-                    (samples_per_lap["Race"] == race) &
-                    (samples_per_lap["Driver"] == driver)
-                ]
-                ax.plot(subset["LapNumber"], subset["SampleCount"],
-                        label=driver, color=colors[driver], alpha=0.8)
-            ax.set_title(race)
-            ax.set_xlabel("Lap Number")
-            ax.set_ylabel("Sample Count")
-            ax.legend()
+        log.info(f"\nTotal paired laps: {len(delta)}")
+        log.info(f"LapTimeDelta stats:")
+        log.info(f"  mean = {delta['LapTimeDelta'].mean():.3f}s")
+        log.info(f"  std  = {delta['LapTimeDelta'].std():.3f}s")
+        log.info(f"  min  = {delta['LapTimeDelta'].min():.3f}s")
+        log.info(f"  max  = {delta['LapTimeDelta'].max():.3f}s")
 
-        save_fig(fig, "02_samples_per_lap.png")
+        # Class balance
+        ver_faster = delta["VER_Faster"].sum()
+        ham_faster = len(delta) - ver_faster
+        log.info(f"\nClass balance:")
+        log.info(f"  VER faster: {ver_faster} ({100*ver_faster/len(delta):.1f}%)")
+        log.info(f"  HAM faster: {ham_faster} ({100*ham_faster/len(delta):.1f}%)")
 
-    except Exception as e:
-        raise CustomException(e, sys)
+        # Same compound rate
+        sc_rate = delta["SameCompound"].mean() * 100
+        log.info(f"\nSame compound rate: {sc_rate:.1f}%")
+        log.info(f"  (Phase 1 was 72.5% — Phase 2 is {sc_rate:.1f}%)")
 
+        # Per-race delta summary
+        log.info(f"\nPer-race delta (VER - HAM):")
+        race_summary = delta.groupby("Race").agg(
+            mean_delta=("LapTimeDelta", "mean"),
+            std_delta =("LapTimeDelta", "std"),
+            n_laps    =("LapTimeDelta", "count"),
+            ver_faster_pct=("VER_Faster", "mean")
+        ).round(3)
+        log.info(f"\n{race_summary.to_string()}")
 
-# ─────────────────────────────────────────
-# SECTION 3 — TELEMETRY: Brake noise + zone length distribution
-# ─────────────────────────────────────────
+        # Upgrade delta effect on lap delta
+        log.info(f"\nUpgrade delta effect on lap time delta:")
+        upg_effect = delta.groupby("upgrade_delta")["LapTimeDelta"].agg(
+            ["mean", "std", "count"]
+        ).round(3)
+        log.info(f"\n{upg_effect.to_string()}")
+        log.info("  upgrade_delta=-1: Mercedes upgrade advantage")
+        log.info("  upgrade_delta=0 : Both at same upgrade level")
+        log.info("  upgrade_delta=+1: Red Bull upgrade advantage")
 
-def eda_brake_zones(tel):
-    try:
-        log.info("=" * 60)
-        log.info("SECTION 3 — Brake Zone Analysis")
-        log.info("=" * 60)
+        # Plot 1 — delta distribution overall
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle("Lap Time Delta Distribution — Full Season 2021", fontsize=13)
 
-        all_zone_lengths = []
-
-        for (race, driver, lap_num), lap_tel in tel.groupby(["Race", "Driver", "LapNumber"]):
-            lap_tel = lap_tel.sort_values("Distance").reset_index(drop=True)
-
-            # Identify brake zone starts and lengths
-            brake = lap_tel["Brake"].astype(bool)
-            zone_id = (brake != brake.shift()).cumsum()
-            brake_zones = lap_tel[brake].groupby(zone_id[brake])["Distance"].agg(
-                lambda x: x.max() - x.min()
-            )
-
-            for length in brake_zones.values:
-                all_zone_lengths.append({
-                    "Race": race, "Driver": driver,
-                    "LapNumber": lap_num, "ZoneLength": length
-                })
-
-        zone_df = pd.DataFrame(all_zone_lengths)
-
-        log.info(f"\n  Total brake zone events detected: {len(zone_df)}")
-        log.info(f"  Zone length stats (metres):")
-        log.info(f"    min    = {zone_df['ZoneLength'].min():.1f}")
-        log.info(f"    median = {zone_df['ZoneLength'].median():.1f}")
-        log.info(f"    mean   = {zone_df['ZoneLength'].mean():.1f}")
-        log.info(f"    max    = {zone_df['ZoneLength'].max():.1f}")
-
-        # How many zones are below various thresholds (noise candidates)
-        for threshold in [5, 10, 20, 30]:
-            count = (zone_df["ZoneLength"] < threshold).sum()
-            pct   = 100 * count / len(zone_df)
-            log.info(f"    Zones < {threshold}m: {count} ({pct:.1f}%) — likely noise")
-
-        log.info(f"\n  Current MIN_BRAKE_ZONE_LENGTH_M = {MIN_BRAKE_ZONE_LENGTH_M}m")
-
-        # Plot brake zone length distribution
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        fig.suptitle("Brake Zone Length Distribution", fontsize=13)
-
-        axes[0].hist(zone_df["ZoneLength"], bins=50, color="#1E3A8A", alpha=0.7)
-        axes[0].axvline(MIN_BRAKE_ZONE_LENGTH_M, color="red", linestyle="--",
-                        label=f"Current threshold ({MIN_BRAKE_ZONE_LENGTH_M}m)")
-        axes[0].set_xlabel("Zone Length (m)")
-        axes[0].set_ylabel("Count")
-        axes[0].set_title("All Zones")
-        axes[0].legend()
-
-        # Zoomed in on short zones (noise region)
-        axes[1].hist(zone_df[zone_df["ZoneLength"] < 100]["ZoneLength"],
-                     bins=40, color="#15803D", alpha=0.7)
-        axes[1].axvline(MIN_BRAKE_ZONE_LENGTH_M, color="red", linestyle="--",
-                        label=f"Current threshold ({MIN_BRAKE_ZONE_LENGTH_M}m)")
-        axes[1].set_xlabel("Zone Length (m)")
-        axes[1].set_ylabel("Count")
-        axes[1].set_title("Zoomed: Zones < 100m")
-        axes[1].legend()
-
-        save_fig(fig, "03_brake_zone_lengths.png")
-
-        return zone_df
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# SECTION 4 — TELEMETRY: Signal distributions per driver per race
-# ─────────────────────────────────────────
-
-def eda_telemetry_signals(tel):
-    try:
-        log.info("=" * 60)
-        log.info("SECTION 4 — Telemetry Signal Distributions")
-        log.info("=" * 60)
-
-        colors = {"VER": "#1E3A8A", "HAM": "#15803D"}
-        races  = tel["Race"].unique()
-
-        # ── 4a: Speed distribution per driver per race ──
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4))
-        fig.suptitle("Speed Distribution per Driver per Race", fontsize=13)
-
-        for i, race in enumerate(races):
-            ax = axes[i]
-            for driver in DRIVERS:
-                data = tel[(tel["Race"] == race) & (tel["Driver"] == driver)]["Speed"]
-                ax.hist(data, bins=40, alpha=0.6, label=driver, color=colors[driver])
-                log.info(f"  Speed | {race} | {driver} | "
-                         f"mean={data.mean():.1f}  min={data.min():.1f}  max={data.max():.1f}")
-            ax.set_title(race)
-            ax.set_xlabel("Speed (km/h)")
-            ax.legend()
-
-        save_fig(fig, "04a_speed_distribution.png")
-
-        # ── 4b: Throttle distribution ──
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4))
-        fig.suptitle("Throttle Distribution per Driver per Race", fontsize=13)
-
-        for i, race in enumerate(races):
-            ax = axes[i]
-            for driver in DRIVERS:
-                data = tel[(tel["Race"] == race) & (tel["Driver"] == driver)]["Throttle"]
-                ax.hist(data, bins=30, alpha=0.6, label=driver, color=colors[driver])
-                full_pct = (data >= FULL_THROTTLE_THRESHOLD).mean() * 100
-                log.info(f"  Throttle | {race} | {driver} | "
-                         f"mean={data.mean():.1f}  full_throttle%={full_pct:.1f}%")
-            ax.set_title(race)
-            ax.set_xlabel("Throttle (%)")
-            ax.legend()
-
-        save_fig(fig, "04b_throttle_distribution.png")
-
-        # ── 4c: Gear shift count per lap per driver per race ──
-        gear_shifts = (
-            tel.groupby(["Race", "Driver", "LapNumber"])
-            .apply(lambda x: (x["nGear"].diff().abs() > 0).sum(), include_groups=False)
-            .reset_index(name="GearShifts")
-        )
-
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4))
-        fig.suptitle("Gear Shifts per Lap per Driver", fontsize=13)
-
-        for i, race in enumerate(races):
-            ax = axes[i]
-            for driver in DRIVERS:
-                data = gear_shifts[
-                    (gear_shifts["Race"] == race) & (gear_shifts["Driver"] == driver)
-                ]["GearShifts"]
-                ax.hist(data, bins=20, alpha=0.6, label=driver, color=colors[driver])
-                log.info(f"  GearShifts | {race} | {driver} | "
-                         f"mean={data.mean():.1f}  min={data.min()}  max={data.max()}")
-            ax.set_title(race)
-            ax.set_xlabel("Gear Shifts per Lap")
-            ax.legend()
-
-        save_fig(fig, "04c_gear_shifts.png")
-
-        # ── 4d: Coasting % per lap per driver per race ──
-        def coasting_pct(group):
-            coasting = ((group["Throttle"] < THROTTLE_OFF_THRESHOLD) &
-                        (~group["Brake"].astype(bool)))
-            return coasting.mean() * 100
-
-        coast_df = (
-            tel.groupby(["Race", "Driver", "LapNumber"])
-            .apply(coasting_pct, include_groups=False)
-            .reset_index(name="CoastingPct")
-        )
-
-        fig, axes = plt.subplots(1, len(races), figsize=(15, 4))
-        fig.suptitle("Coasting % per Lap per Driver", fontsize=13)
-
-        for i, race in enumerate(races):
-            ax = axes[i]
-            for driver in DRIVERS:
-                data = coast_df[
-                    (coast_df["Race"] == race) & (coast_df["Driver"] == driver)
-                ]["CoastingPct"]
-                ax.hist(data, bins=20, alpha=0.6, label=driver, color=colors[driver])
-                log.info(f"  Coasting% | {race} | {driver} | "
-                         f"mean={data.mean():.2f}%  min={data.min():.2f}%  max={data.max():.2f}%")
-            ax.set_title(race)
-            ax.set_xlabel("Coasting % of Lap")
-            ax.legend()
-
-        save_fig(fig, "04d_coasting_pct.png")
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# SECTION 5 — TARGET: lap delta, class balance, lap symmetry, compound overlap
-# ─────────────────────────────────────────
-
-def eda_target(laps):
-    try:
-        log.info("=" * 60)
-        log.info("SECTION 5 — Target Variable Analysis")
-        log.info("=" * 60)
-
-        races = laps["Race"].unique()
-
-        # ── 5a: Lap count symmetry — find paired laps ──
-        ver_laps = laps[laps["Driver"] == "VER"][["Race", "LapNumber"]].copy()
-        ham_laps = laps[laps["Driver"] == "HAM"][["Race", "LapNumber"]].copy()
-
-        paired = ver_laps.merge(ham_laps, on=["Race", "LapNumber"], how="inner")
-        log.info(f"\n  Total VER laps : {len(ver_laps)}")
-        log.info(f"  Total HAM laps : {len(ham_laps)}")
-        log.info(f"  Paired laps    : {len(paired)}")
-        log.info(f"  Unpaired laps  : {len(ver_laps) + len(ham_laps) - 2 * len(paired)}")
-
-        for race in races:
-            v = set(ver_laps[ver_laps["Race"] == race]["LapNumber"])
-            h = set(ham_laps[ham_laps["Race"] == race]["LapNumber"])
-            only_ver = v - h
-            only_ham = h - v
-            log.info(f"  {race} — VER only laps: {sorted(only_ver)} | HAM only laps: {sorted(only_ham)}")
-
-        # ── 5b: Build lap delta on paired laps ──
-        ver_data = laps[laps["Driver"] == "VER"][["Race", "LapNumber", "LapTimeSec",
-                                                   "Compound", "TyreLife"]].copy()
-        ham_data = laps[laps["Driver"] == "HAM"][["Race", "LapNumber", "LapTimeSec",
-                                                   "Compound", "TyreLife"]].copy()
-
-        ver_data.columns = ["Race", "LapNumber", "VER_LapTime", "VER_Compound", "VER_TyreLife"]
-        ham_data.columns = ["Race", "LapNumber", "HAM_LapTime", "HAM_Compound", "HAM_TyreLife"]
-
-        delta_df = ver_data.merge(ham_data, on=["Race", "LapNumber"])
-        delta_df["LapTimeDelta"] = delta_df["VER_LapTime"] - delta_df["HAM_LapTime"]
-        delta_df["VER_Faster"]   = (delta_df["LapTimeDelta"] < 0).astype(int)
-
-        log.info(f"\n  Lap time delta (VER - HAM) stats:")
-        log.info(f"    mean   = {delta_df['LapTimeDelta'].mean():.3f}s")
-        log.info(f"    std    = {delta_df['LapTimeDelta'].std():.3f}s")
-        log.info(f"    min    = {delta_df['LapTimeDelta'].min():.3f}s")
-        log.info(f"    max    = {delta_df['LapTimeDelta'].max():.3f}s")
-
-        for race in races:
-            subset = delta_df[delta_df["Race"] == race]["LapTimeDelta"]
-            log.info(f"  {race} delta — mean={subset.mean():.3f}s  std={subset.std():.3f}s")
-
-        # ── 5c: Class balance ──
-        ver_faster_count = delta_df["VER_Faster"].sum()
-        ham_faster_count = len(delta_df) - ver_faster_count
-        log.info(f"\n  Class balance (VER_Faster):")
-        log.info(f"    VER faster (1): {ver_faster_count} laps ({100*ver_faster_count/len(delta_df):.1f}%)")
-        log.info(f"    HAM faster (0): {ham_faster_count} laps ({100*ham_faster_count/len(delta_df):.1f}%)")
-
-        # ── 5d: Compound overlap check ──
-        same_compound = (delta_df["VER_Compound"] == delta_df["HAM_Compound"]).sum()
-        diff_compound = len(delta_df) - same_compound
-        log.info(f"\n  Compound overlap:")
-        log.info(f"    Same compound laps : {same_compound} ({100*same_compound/len(delta_df):.1f}%)")
-        log.info(f"    Diff compound laps : {diff_compound} ({100*diff_compound/len(delta_df):.1f}%)")
-
-        diff_rows = delta_df[delta_df["VER_Compound"] != delta_df["HAM_Compound"]][
-            ["Race", "LapNumber", "VER_Compound", "HAM_Compound", "LapTimeDelta"]
-        ]
-        if len(diff_rows) > 0:
-            log.info(f"\n  Laps where compounds differ:\n{diff_rows.to_string(index=False)}")
-
-        # ── 5e: Plots ──
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-        fig.suptitle("Target Variable Analysis", fontsize=13)
-
-        # Delta distribution
-        axes[0].hist(delta_df["LapTimeDelta"], bins=30, color="#1E3A8A", alpha=0.7)
+        axes[0].hist(delta["LapTimeDelta"], bins=50, color="#1E3A8A", alpha=0.7)
         axes[0].axvline(0, color="red", linestyle="--", label="Zero (equal)")
+        axes[0].axvline(delta["LapTimeDelta"].mean(), color="orange",
+                        linestyle="--", label=f"Mean={delta['LapTimeDelta'].mean():.3f}s")
         axes[0].set_xlabel("VER - HAM Lap Time (s)")
         axes[0].set_ylabel("Count")
-        axes[0].set_title("Lap Time Delta Distribution")
+        axes[0].set_title("Overall Distribution")
         axes[0].legend()
 
-        # Delta across race laps per race
-        colors_race = {"Bahrain": "#1E3A8A", "Spain": "#15803D", "AbuDhabi": "#B45309"}
-        for race, grp in delta_df.groupby("Race"):
-            axes[1].plot(grp["LapNumber"], grp["LapTimeDelta"],
-                         label=race, color=colors_race.get(race, "gray"), alpha=0.8)
-        axes[1].axhline(0, color="red", linestyle="--")
-        axes[1].set_xlabel("Lap Number")
-        axes[1].set_ylabel("VER - HAM (s)")
-        axes[1].set_title("Delta Across Race Laps")
-        axes[1].legend()
+        # Plot 2 — per-race mean delta with upgrade context
+        race_order = delta.groupby("Race")["LapTimeDelta"].mean().sort_values().index
+        means = [delta[delta["Race"]==r]["LapTimeDelta"].mean() for r in race_order]
+        bar_colors = ["#15803D" if m < 0 else "#1E3A8A" for m in means]
+        axes[1].barh(list(race_order), means, color=bar_colors, alpha=0.8)
+        axes[1].axvline(0, color="red", linestyle="--", linewidth=1)
+        axes[1].set_xlabel("Mean Lap Delta (s) — Negative = HAM Faster")
+        axes[1].set_title("Mean Delta per Race\n(Green=HAM faster, Blue=VER faster)")
+        axes[1].grid(True, alpha=0.3, axis="x")
 
-        # Class balance bar
-        axes[2].bar(["HAM Faster (0)", "VER Faster (1)"],
-                    [ham_faster_count, ver_faster_count],
-                    color=["#15803D", "#1E3A8A"])
-        axes[2].set_ylabel("Lap Count")
-        axes[2].set_title("Class Balance")
+        save_fig(fig, "p2_02_lap_delta_distribution.png")
 
-        save_fig(fig, "05_target_analysis.png")
-
-        return delta_df
+        return delta
 
     except Exception as e:
         raise CustomException(e, sys)
-    
+
+
 # ─────────────────────────────────────────
-# SECTION 7 — TEAMMATE COMPARISON
-# Separates driver style from car design philosophy
-# VER vs PER (same Red Bull), HAM vs BOT (same Mercedes)
+# SECTION 3 — DRIVING STYLE ACROSS ALL RACES
+# Do Phase 1 patterns hold at full season scale?
 # ─────────────────────────────────────────
 
-def eda_teammate_comparison(session_cache_dir):
-    """
-    Pull Perez and Bottas telemetry for the same 3 races.
-    Compute within-team style residuals:
-        VER_style = VER_metric - PER_metric  (pure driver, same car)
-        HAM_style = HAM_metric - BOT_metric  (pure driver, same car)
-    Compare VER_style vs HAM_style.
-    If VER coasts more than Perez in the same car -> that is VER's choice.
-    If VER and Perez coast equally -> that is the Red Bull car requiring it.
-    """
+def eda_style_consistency(laps):
     try:
-        import fastf1
-        fastf1.Cache.enable_cache(session_cache_dir)
-
         log.info("=" * 60)
-        log.info("SECTION 7 — Teammate Comparison (Style vs Car)")
+        log.info("SECTION 3 — Driving Style Consistency Across All Races")
         log.info("=" * 60)
 
-        # Drivers to compare: {driver: teammate}
-        teammate_pairs = {"VER": "PER", "HAM": "BOT"}
-        all_drivers    = ["VER", "PER", "HAM", "BOT"]
+        # We compute lap-level coasting and full throttle from laps data
+        # Note: telemetry is not loaded here — we use per-race aggregates
+        # from the pre-computed laps file which only has timing data.
+        # Style metrics require telemetry and will be computed in
+        # data_transformation.py. Here we check what lap-level data tells us.
 
-        style_records = []
+        green = laps[(laps["TrackStatus"] == 1) &
+                     (laps["Driver"].isin(DRIVERS))].copy()
 
-        for round_number, race_label in RACES:
-            log.info(f"\n  Loading {race_label} for teammate comparison...")
-            session = fastf1.get_session(SEASON, round_number, SESSION_TYPE)
-            session.load(telemetry=True, laps=True, weather=False, messages=False)
+        # Lap time consistency per driver per race
+        # A proxy for pace: lower std = more consistent laps
+        consistency = green.groupby(["Race", "Driver"])["LapTimeSec"].agg(
+            ["mean", "std", "count"]
+        ).round(3)
 
-            driver_metrics = {}
+        log.info(f"\nLap time consistency (mean, std, count) per driver per race:")
+        log.info(f"\n{consistency.to_string()}")
 
-            for driver in all_drivers:
-                try:
-                    laps = session.laps.pick_drivers(driver).pick_quicklaps().copy()
-                    if len(laps) < 5:
-                        log.info(f"    {driver} has fewer than 5 clean laps in "
-                                 f"{race_label} — skipping")
-                        continue
+        # TyreLife distribution per race — are stints comparable?
+        tyre_life = green.groupby(["Race", "Driver"])["TyreLife"].agg(
+            ["mean", "max"]
+        ).round(1)
+        log.info(f"\nTyre life per driver per race (mean, max):")
+        log.info(f"\n{tyre_life.to_string()}")
 
-                    coasting_vals   = []
-                    full_thr_vals   = []
-                    gear_shift_vals = []
-                    brake_len_vals  = []
+        # Compound usage per race
+        compound_counts = green.groupby(
+            ["Race", "Driver", "Compound"]
+        ).size().unstack(fill_value=0)
+        log.info(f"\nCompound usage per driver per race:")
+        log.info(f"\n{compound_counts.to_string()}")
 
-                    for _, lap in laps.iterrows():
-                        try:
-                            tel = lap.get_telemetry()
-                        except Exception:
-                            continue
+        # Plot — lap time std per race (pace consistency)
+        ver_std = consistency.xs("VER", level="Driver")["std"] if "VER" in \
+            consistency.index.get_level_values("Driver") else pd.Series()
+        ham_std = consistency.xs("HAM", level="Driver")["std"] if "HAM" in \
+            consistency.index.get_level_values("Driver") else pd.Series()
 
-                        tel = tel.sort_values("Distance").reset_index(drop=True)
-                        brake    = tel["Brake"].astype(bool)
-                        throttle = tel["Throttle"]
-                        gear     = tel["nGear"]
+        common_races = ver_std.index.intersection(ham_std.index)
+        x = range(len(common_races))
 
-                        # Coasting %
-                        coasting = ((throttle < THROTTLE_OFF_THRESHOLD) & (~brake))
-                        coasting_vals.append(coasting.mean() * 100)
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(list(x), [ver_std[r] for r in common_races],
+                "o-", color=COLORS["VER"], label="VER std", alpha=0.8)
+        ax.plot(list(x), [ham_std[r] for r in common_races],
+                "o-", color=COLORS["HAM"], label="HAM std", alpha=0.8)
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(list(common_races), rotation=45, ha="right")
+        ax.set_ylabel("Lap Time Std (s)")
+        ax.set_title("Lap Time Consistency per Race — VER vs HAM\n"
+                     "Lower = More Consistent Pace")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        save_fig(fig, "p2_03_pace_consistency.png")
 
-                        # Full throttle %
-                        full_thr_vals.append(
-                            (throttle >= FULL_THROTTLE_THRESHOLD).mean() * 100
-                        )
+        return consistency
 
-                        # Gear shifts
-                        gear_shift_vals.append((gear.diff().abs() > 0).sum())
+    except Exception as e:
+        raise CustomException(e, sys)
 
-                        # Avg brake zone length
-                        zone_id = (brake != brake.shift()).cumsum()
-                        brake_lengths = tel[brake].groupby(
-                            zone_id[brake])["Distance"].agg(
-                            lambda x: x.max() - x.min()
-                        )
-                        real_zones = brake_lengths[
-                            brake_lengths >= MIN_BRAKE_ZONE_LENGTH_M
-                        ]
-                        brake_len_vals.append(
-                            real_zones.mean() if len(real_zones) > 0 else 0.0
-                        )
 
-                    if len(coasting_vals) == 0:
-                        continue
+# ─────────────────────────────────────────
+# SECTION 4 — UPGRADE EFFECT VALIDATION
+# Does upgrade_delta predict who is faster?
+# ─────────────────────────────────────────
 
-                    driver_metrics[driver] = {
-                        "coasting_pct"      : np.mean(coasting_vals),
-                        "full_throttle_pct" : np.mean(full_thr_vals),
-                        "gear_shifts"       : np.mean(gear_shift_vals),
-                        "brake_zone_length" : np.mean(brake_len_vals),
-                    }
-                    log.info(f"    {driver} | coasting={np.mean(coasting_vals):.2f}% | "
-                             f"full_thr={np.mean(full_thr_vals):.2f}% | "
-                             f"gear_shifts={np.mean(gear_shift_vals):.1f} | "
-                             f"brake_len={np.mean(brake_len_vals):.1f}m")
+def eda_upgrade_effect(delta_df, meta):
+    try:
+        log.info("=" * 60)
+        log.info("SECTION 4 — Upgrade Effect on Lap Time Delta")
+        log.info("=" * 60)
 
-                except Exception as ex:
-                    log.warning(f"    Could not process {driver} in {race_label}: {ex}")
+        # Per upgrade_delta level: mean delta, % VER faster
+        upg = delta_df.groupby("upgrade_delta").agg(
+            mean_delta    =("LapTimeDelta", "mean"),
+            std_delta     =("LapTimeDelta", "std"),
+            ver_faster_pct=("VER_Faster",   "mean"),
+            n_laps        =("LapTimeDelta", "count")
+        ).round(3)
+
+        log.info(f"\nUpgrade delta → Lap time delta relationship:")
+        log.info(f"\n{upg.to_string()}")
+
+        log.info(f"\n  INTERPRETATION:")
+        for udelta, row in upg.iterrows():
+            if udelta < 0:
+                car = "Mercedes upgrade advantage"
+            elif udelta > 0:
+                car = "Red Bull upgrade advantage"
+            else:
+                car = "Both at same upgrade level"
+            log.info(f"  upgrade_delta={udelta:+d} ({car}): "
+                     f"mean delta={row['mean_delta']:.3f}s, "
+                     f"VER faster {100*row['ver_faster_pct']:.1f}% of laps "
+                     f"(n={int(row['n_laps'])})")
+
+        # Is the upgrade_delta a useful feature?
+        # If mean_delta changes monotonically with upgrade_delta, it is useful
+        deltas = upg["mean_delta"].values
+        is_monotone = all(deltas[i] <= deltas[i+1]
+                          for i in range(len(deltas)-1)) or \
+                      all(deltas[i] >= deltas[i+1]
+                          for i in range(len(deltas)-1))
+        log.info(f"\n  Upgrade delta monotonically predicts lap delta: {is_monotone}")
+        if is_monotone:
+            log.info("  → upgrade_delta is a VALID feature — include in transformation")
+        else:
+            log.info("  → upgrade_delta is NOT monotone — check for confounds")
+
+        # Plot
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle("Car Upgrade Level Effect on Lap Time Delta", fontsize=13)
+
+        upgrade_levels = upg.index.tolist()
+        axes[0].bar([str(u) for u in upgrade_levels],
+                    upg["mean_delta"],
+                    color=["#15803D" if u < 0 else
+                           "#6B7280" if u == 0 else
+                           "#1E3A8A" for u in upgrade_levels],
+                    alpha=0.8)
+        axes[0].axhline(0, color="red", linestyle="--", linewidth=1)
+        axes[0].set_xlabel("Upgrade Delta (VER level - HAM level)")
+        axes[0].set_ylabel("Mean Lap Delta (s)")
+        axes[0].set_title("Mean Delta by Upgrade Level")
+        axes[0].grid(True, alpha=0.3, axis="y")
+
+        axes[1].bar([str(u) for u in upgrade_levels],
+                    upg["ver_faster_pct"] * 100,
+                    color="#1E3A8A", alpha=0.8)
+        axes[1].axhline(50, color="red", linestyle="--",
+                        linewidth=1, label="50% (equal)")
+        axes[1].set_xlabel("Upgrade Delta (VER level - HAM level)")
+        axes[1].set_ylabel("% Laps VER Faster")
+        axes[1].set_title("VER Win Rate by Upgrade Level")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3, axis="y")
+
+        save_fig(fig, "p2_04_upgrade_effect.png")
+
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# SECTION 5 — COMPOUND MISMATCH AT SCALE
+# ─────────────────────────────────────────
+
+def eda_compound_mismatch(delta_df):
+    try:
+        log.info("=" * 60)
+        log.info("SECTION 5 — Compound Mismatch Analysis")
+        log.info("=" * 60)
+
+        sc_rate     = delta_df["SameCompound"].mean() * 100
+        mismatch_n  = (delta_df["SameCompound"] == 0).sum()
+        same_n      = (delta_df["SameCompound"] == 1).sum()
+
+        log.info(f"Same compound laps : {same_n} ({sc_rate:.1f}%)")
+        log.info(f"Diff compound laps : {mismatch_n} ({100-sc_rate:.1f}%)")
+
+        # Per-race mismatch rate
+        race_sc = delta_df.groupby("Race")["SameCompound"].mean() * 100
+        log.info(f"\nSame compound rate per race:")
+        log.info(f"\n{race_sc.round(1).to_string()}")
+
+        # Mean delta on same vs different compound
+        same_delta = delta_df[delta_df["SameCompound"]==1]["LapTimeDelta"]
+        diff_delta = delta_df[delta_df["SameCompound"]==0]["LapTimeDelta"]
+        log.info(f"\nMean delta — same compound : {same_delta.mean():.3f}s "
+                 f"(std={same_delta.std():.3f}s)")
+        log.info(f"Mean delta — diff compound : {diff_delta.mean():.3f}s "
+                 f"(std={diff_delta.std():.3f}s)")
+        log.info(f"Std ratio (diff/same)      : {diff_delta.std()/same_delta.std():.2f}x "
+                 f"more variable on diff compound")
+
+        log.info(f"\n  RECOMMENDATION:")
+        if sc_rate >= 60:
+            log.info(f"  Same-compound subset ({same_n} laps) is sufficient for SC model.")
+        else:
+            log.info(f"  Same-compound subset ({same_n} laps) may be too small — check.")
+
+        # Plot
+        fig, ax = plt.subplots(figsize=(10, 5))
+        race_sc_sorted = race_sc.sort_values()
+        colors = ["#DC2626" if v < 50 else "#1E3A8A" for v in race_sc_sorted]
+        ax.barh(race_sc_sorted.index, race_sc_sorted, color=colors, alpha=0.8)
+        ax.axvline(50, color="black", linestyle="--", linewidth=1,
+                   label="50% threshold")
+        ax.set_xlabel("Same Compound %")
+        ax.set_title("Same Compound Rate per Race\n"
+                     "(Red = < 50% same compound, high mismatch)")
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis="x")
+        save_fig(fig, "p2_05_compound_mismatch.png")
+
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# SECTION 6 — TEAMMATE STYLE RESIDUALS AT SCALE
+# Are Phase 1 coasting/braking patterns consistent across all races?
+# Note: This section uses lap-level data only (no telemetry).
+# Telemetry-based style metrics computed in data_transformation.
+# Here we check tyre life and lap time as proxies.
+# ─────────────────────────────────────────
+
+def eda_teammate_proxy(laps):
+    try:
+        log.info("=" * 60)
+        log.info("SECTION 6 — Teammate Proxy Analysis")
+        log.info("=" * 60)
+        log.info("Note: Full telemetry-based style metrics computed in transformation.")
+        log.info("This section checks lap time proxy for teammate comparison.")
+
+        green = laps[laps["TrackStatus"] == 1].copy()
+
+        # For each race, compare VER vs PER and HAM vs BOT lap time mean
+        # If VER consistently beats PER and HAM consistently beats BOT,
+        # it tells us these are the faster drivers in their respective cars
+        # (which we already know but want to confirm in the data)
+
+        results = []
+        for race in green["Race"].unique():
+            race_data = green[green["Race"] == race]
+            for driver, teammate in TEAMMATE_PAIRS.items():
+                drv_laps = race_data[race_data["Driver"] == driver]["LapTimeSec"]
+                tmm_laps = race_data[race_data["Driver"] == teammate]["LapTimeSec"]
+
+                if len(drv_laps) < 5 or len(tmm_laps) < 5:
                     continue
 
-            # Compute within-team residuals
-            for driver, teammate in teammate_pairs.items():
-                if driver in driver_metrics and teammate in driver_metrics:
-                    for metric in ["coasting_pct", "full_throttle_pct",
-                                   "gear_shifts", "brake_zone_length"]:
-                        style_records.append({
-                            "Race"     : race_label,
-                            "Driver"   : driver,
-                            "Teammate" : teammate,
-                            "Metric"   : metric,
-                            "Driver_val"  : driver_metrics[driver][metric],
-                            "Teammate_val": driver_metrics[teammate][metric],
-                            "Style_residual": (driver_metrics[driver][metric] -
-                                               driver_metrics[teammate][metric]),
-                        })
+                results.append({
+                    "Race"          : race,
+                    "Driver"        : driver,
+                    "Teammate"      : teammate,
+                    "Driver_mean"   : drv_laps.mean(),
+                    "Teammate_mean" : tmm_laps.mean(),
+                    "Delta_vs_tmm"  : drv_laps.mean() - tmm_laps.mean(),
+                })
 
-        if len(style_records) == 0:
-            log.warning("  No teammate data computed — skipping Section 7 plots.")
-            return
+        proxy_df = pd.DataFrame(results)
 
-        style_df = pd.DataFrame(style_records)
+        log.info(f"\nLap time delta vs teammate (Driver - Teammate):")
+        log.info(f"Negative = Driver faster than teammate")
+        summary = proxy_df.groupby("Driver")["Delta_vs_tmm"].agg(
+            ["mean", "std", "min", "max", "count"]
+        ).round(3)
+        log.info(f"\n{summary.to_string()}")
 
-        log.info("\n  Within-team style residuals (Driver - Teammate, same car):")
-        log.info("  Positive = Driver does MORE of this than teammate")
-        summary = style_df.groupby(["Driver", "Metric"])["Style_residual"].mean()
-        log.info(f"\n{summary.round(3).to_string()}")
+        # Count how often each driver is faster than teammate
+        proxy_df["Driver_faster"] = (proxy_df["Delta_vs_tmm"] < 0).astype(int)
+        win_rate = proxy_df.groupby("Driver")["Driver_faster"].mean() * 100
+        log.info(f"\nDriver faster than teammate (% of races):")
+        log.info(f"\n{win_rate.round(1).to_string()}")
 
-        # ── Plot: style residuals per metric per race ──
-        metrics    = ["coasting_pct", "full_throttle_pct",
-                      "gear_shifts", "brake_zone_length"]
-        metric_labels = ["Coasting % (Driver - Teammate)",
-                         "Full Throttle % (Driver - Teammate)",
-                         "Gear Shifts (Driver - Teammate)",
-                         "Brake Zone Length m (Driver - Teammate)"]
+        # Plot
+        fig, ax = plt.subplots(figsize=(14, 5))
+        for driver, color in [("VER", COLORS["VER"]), ("HAM", COLORS["HAM"])]:
+            subset = proxy_df[proxy_df["Driver"] == driver].sort_values("Race")
+            ax.plot(subset["Race"], subset["Delta_vs_tmm"],
+                    "o-", color=color, label=f"{driver} vs teammate",
+                    alpha=0.8)
+        ax.axhline(0, color="red", linestyle="--", linewidth=1)
+        ax.set_xlabel("Race")
+        ax.set_ylabel("Lap Time Delta vs Teammate (s)")
+        ax.set_title("Driver Lap Time vs Teammate — Full Season\n"
+                     "Negative = Driver faster than teammate")
+        ax.tick_params(axis="x", rotation=45)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        save_fig(fig, "p2_06_teammate_proxy.png")
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(
-            "Driver Style vs Teammate — Same Car Comparison\n"
-            "VER vs PER (Red Bull) | HAM vs BOT (Mercedes)\n"
-            "Positive = Driver does MORE of this than teammate → driver choice, not car",
-            fontsize=12
-        )
-        axes = axes.flatten()
-        colors = {"VER": "#1E3A8A", "HAM": "#15803D"}
-        races  = style_df["Race"].unique()
-        x      = np.arange(len(races))
-        width  = 0.35
-
-        for i, (metric, label) in enumerate(zip(metrics, metric_labels)):
-            ax = axes[i]
-            for j, driver in enumerate(["VER", "HAM"]):
-                vals = []
-                for race in races:
-                    row = style_df[
-                        (style_df["Driver"] == driver) &
-                        (style_df["Metric"] == metric) &
-                        (style_df["Race"]   == race)
-                    ]
-                    vals.append(row["Style_residual"].values[0]
-                                if len(row) > 0 else 0.0)
-                offset = (j - 0.5) * width
-                ax.bar(x + offset, vals, width,
-                       label=f"{driver} - teammate",
-                       color=colors[driver], alpha=0.8)
-
-            ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-            ax.set_xticks(x)
-            ax.set_xticklabels(races)
-            ax.set_ylabel(label)
-            ax.set_title(label.split("(")[0].strip())
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.2, axis="y")
-
-        plt.tight_layout()
-        save_fig(fig, "15_teammate_style_comparison.png")
-
-        # ── Log interpretation ──
-        log.info("\n  INTERPRETATION:")
-        for driver in ["VER", "HAM"]:
-            log.info(f"\n  {driver}:")
-            for metric in metrics:
-                avg_residual = style_df[
-                    (style_df["Driver"] == driver) &
-                    (style_df["Metric"] == metric)
-                ]["Style_residual"].mean()
-                direction = "MORE" if avg_residual > 0 else "LESS"
-                log.info(f"    {metric:<25} {direction} than teammate "
-                         f"by {abs(avg_residual):.3f} (avg across races)")
-
-        log.info("\n  → Residuals that are consistently positive/negative across all 3 races")
-        log.info("    are DRIVER choices. Residuals that vary by race are CAR/STRATEGY effects.")
+        return proxy_df
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# SECTION 6 — SUMMARY: config recommendations
+# SECTION 7 — CONFIG RECOMMENDATIONS
 # ─────────────────────────────────────────
 
-def print_config_recommendations(laps, tel, zone_df, delta_df):
+def eda_config_recommendations(delta_df, laps):
     try:
         log.info("=" * 60)
-        log.info("SECTION 6 — CONFIG RECOMMENDATIONS")
+        log.info("SECTION 7 — Config Recommendations for Transformation")
         log.info("=" * 60)
 
-        # Recommend MIN_BRAKE_ZONE_LENGTH_M based on noise analysis
-        p10 = zone_df["ZoneLength"].quantile(0.10)
-        log.info(f"\n  [THRESHOLD] MIN_BRAKE_ZONE_LENGTH_M:")
-        log.info(f"    10th percentile of all brake zone lengths = {p10:.1f}m")
-        log.info(f"    Recommendation: set to {max(10, round(p10)):.0f}m "
-                 f"(filters bottom 10% as noise)")
+        # SC subset size
+        sc_n = (delta_df["SameCompound"] == 1).sum()
+        total_n = len(delta_df)
+        log.info(f"\n  [DATASET SIZE]")
+        log.info(f"    Total paired laps : {total_n}")
+        log.info(f"    SC paired laps    : {sc_n} ({100*sc_n/total_n:.1f}%)")
 
-        # Class balance recommendation
+        # Class balance
         ver_pct = delta_df["VER_Faster"].mean()
         log.info(f"\n  [CLASS BALANCE] VER_Faster = {ver_pct:.2f}")
         if ver_pct < 0.40 or ver_pct > 0.60:
-            log.info("    Recommendation: use class_weight='balanced' in classifier")
+            log.info("    Recommendation: use class_weight='balanced'")
         else:
-            log.info("    Recommendation: class balance is acceptable, no reweighting needed")
+            log.info("    Recommendation: class balance acceptable")
 
-        # Non-green laps
+        # Non-green flag rate
         non_green_pct = (laps["TrackStatus"] != 1).mean() * 100
-        log.info(f"\n  [TRACK STATUS] Non-green flag laps = {non_green_pct:.1f}%")
-        log.info("    Recommendation: filter TrackStatus == 1 in data_transformation.py")
+        log.info(f"\n  [TRACK STATUS] Non-green = {non_green_pct:.1f}%")
+        log.info("    Recommendation: filter TrackStatus == 1")
 
-        # Compound overlap
-        ver_data = laps[laps["Driver"] == "VER"][["Race", "LapNumber", "Compound"]]
-        ham_data = laps[laps["Driver"] == "HAM"][["Race", "LapNumber", "Compound"]]
-        ver_data.columns = ["Race", "LapNumber", "VER_Compound"]
-        ham_data.columns = ["Race", "LapNumber", "HAM_Compound"]
-        merged = ver_data.merge(ham_data, on=["Race", "LapNumber"])
-        diff_pct = (merged["VER_Compound"] != merged["HAM_Compound"]).mean() * 100
-        log.info(f"\n  [COMPOUND MISMATCH] {diff_pct:.1f}% of paired laps have different compounds")
-        if diff_pct > 5:
-            log.info("    Recommendation: add 'same_compound' flag as feature in transformation")
-        else:
-            log.info("    Recommendation: compound mismatch is minimal, safe to include compound as feature")
+        # Upgrade delta distribution
+        upg_dist = delta_df["upgrade_delta"].value_counts().sort_index()
+        log.info(f"\n  [UPGRADE DELTA DISTRIBUTION]")
+        log.info(f"\n{upg_dist.to_string()}")
+        log.info("    Recommendation: include upgrade_delta as feature — "
+                 "sufficient variance across levels")
 
-        # Sample count consistency
-        samples = tel.groupby(["Race", "Driver", "LapNumber"]).size()
-        median_s = samples.median()
-        thin_pct = (samples < median_s * 0.5).mean() * 100
-        log.info(f"\n  [TELEMETRY SAMPLES] Median samples/lap = {median_s:.0f}")
-        log.info(f"    Thin laps (<50% median): {thin_pct:.1f}%")
-        if thin_pct > 2:
-            log.info("    Recommendation: filter thin laps in data_transformation.py")
+        # Target distribution
+        log.info(f"\n  [TARGET DISTRIBUTION]")
+        log.info(f"    mean = {delta_df['LapTimeDelta'].mean():.3f}s")
+        log.info(f"    std  = {delta_df['LapTimeDelta'].std():.3f}s")
+        log.info(f"    skew = {delta_df['LapTimeDelta'].skew():.3f}")
+        if abs(delta_df["LapTimeDelta"].skew()) > 1.0:
+            log.info("    WARNING: Target is skewed — check for outlier races")
         else:
-            log.info("    Recommendation: sample count is consistent, no filtering needed")
+            log.info("    Target distribution is acceptable")
 
         log.info("\n" + "=" * 60)
-        log.info("Update config.py INITIAL_MODEL_PARAMS based on the above before running data_transformation.py")
+        log.info("Update config.py INITIAL_MODEL_PARAMS after reviewing EDA")
+        log.info("Then run data_transformation.py")
         log.info("=" * 60)
 
     except Exception as e:
@@ -760,31 +575,27 @@ def print_config_recommendations(laps, tel, zone_df, delta_df):
 # ─────────────────────────────────────────
 
 def run_eda():
-
-
     try:
-        laps, tel = load_data()
+        log.info("=" * 60)
+        log.info("Starting EDA — Phase 2 (Full 2021 Season)")
+        log.info("=" * 60)
 
-        eda_laps(laps)
-        eda_telemetry_alignment(tel)
-        zone_df  = eda_brake_zones(tel)
-        eda_telemetry_signals(tel)
-        delta_df = eda_target(laps)
-        print_config_recommendations(laps, tel, zone_df, delta_df)
+        laps, meta = load_data()
+
+        green, paired = eda_data_quality(laps, meta)
+        delta_df      = eda_lap_delta(laps, meta)
+        consistency   = eda_style_consistency(laps)
+        eda_upgrade_effect(delta_df, meta)
+        eda_compound_mismatch(delta_df)
+        proxy_df      = eda_teammate_proxy(laps)
+        eda_config_recommendations(delta_df, laps)
 
         log.info("EDA complete. All plots saved to artifacts/")
-        
-        try:
-            from src.config import CACHE_DIR, SESSION_TYPE
-            eda_teammate_comparison(CACHE_DIR)
-        except Exception as e:
-            log.warning(f"Section 7 skipped: {e}")
-    
-        return laps, tel, zone_df, delta_df
+        return delta_df, proxy_df
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 if __name__ == "__main__":
-    run_eda()
+    delta_df, proxy_df = run_eda()
