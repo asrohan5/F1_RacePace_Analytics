@@ -197,7 +197,7 @@ EXCLUDE_ROUNDS = {5}     # Monaco — street circuit, unrepresentative lap times
 
 # Rounds excluded from VER vs HAM paired analysis only
 # (one or both primary drivers did not complete meaningful laps)
-EXCLUDE_FROM_PAIRING = {10, 11, 15}
+EXCLUDE_FROM_PAIRING = {10, 11, 12, 15}
 # Britain (R10) — VER lap 1 retirement
 # Hungary (R11) — VER rejoined last after lap 1 incident, unrepresentative laps
 # Russia  (R15) — VER grid penalty + strategic pit, unrepresentative deltas
@@ -288,11 +288,11 @@ if __name__ == "__main__":
             f"(Imola=sprint, Italy=incidents, SaudiArabia=chaos)")
 
     log.info("\nEffective training races after all exclusions:")
-    excluded_all = EXCLUDE_ROUNDS | EXCLUDE_FROM_PAIRING | {TEST_ROUND} | set(
-        rnd for rnd, _ in RACES if _ in VAL_RACES
-    )
+
+    excluded_all = EXCLUDE_ROUNDS | EXCLUDE_FROM_PAIRING | {TEST_ROUND}
+
     for rnd, label in RACES:
-        if rnd in excluded_all:
+        if rnd in EXCLUDE_ROUNDS or rnd in EXCLUDE_FROM_PAIRING:
             status = "EXCLUDED"
         elif rnd == TEST_ROUND:
             status = "TEST"
