@@ -3,365 +3,435 @@ import sys
 import pandas as pd
 import numpy as np
 import pickle
-import re
+import warnings
+warnings.filterwarnings("ignore")
 
 from sklearn.dummy import DummyRegressor, DummyClassifier
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.model_selection import RandomizedSearchCV, cross_val_score
-from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error, r2_score,
-    accuracy_score, f1_score, roc_auc_score
-)
-from xgboost import XGBRegressor, XGBClassifier
-from sklearn.linear_model import (LinearRegression, LogisticRegression,
-                                   RidgeCV, LassoCV)
-from lightgbm import LGBMRegressor, LGBMClassifier
+from sklearn.model_selection import GroupKFold, RandomizedSearchCV, cross_val_score
+from sklearn.metrics import (mean_absolute_error, r2_score,
+                             roc_auc_score, f1_score, accuracy_score)
+import xgboost as xgb
+import lightgbm as lgb
 
 from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
-    TRAIN_PATH, VAL_PATH,
-    TRAIN_SC_PATH, VAL_SC_PATH,
-    CLASSIFIER_PATH, REGRESSOR_PATH,
-    CLASSIFIER_SC_PATH, REGRESSOR_SC_PATH,
+    TRAIN_PATH, VAL_PATH, TEST_PATH,
+    TRAIN_SC_PATH, VAL_SC_PATH, TEST_SC_PATH,
+    REGRESSOR_PATH, CLASSIFIER_PATH,
+    REGRESSOR_SC_PATH, CLASSIFIER_SC_PATH,
     TARGET_REGRESSION, TARGET_CLASSIFICATION,
-    INITIAL_MODEL_PARAMS
+    INITIAL_MODEL_PARAMS,
 )
-import warnings
-warnings.filterwarnings('ignore')
 
-
-#-----------------------------------------------------------------------------------------------------------------------------------------
-
-FEATURE_COLS = [
-    "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
-    "avg_brake_zone_length_delta", "avg_entry_speed_delta",
-    "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
-    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
-    "VER_coasting_pct", "HAM_coasting_pct",
-    "VER_full_throttle_pct", "HAM_full_throttle_pct",
-    "VER_gear_shifts", "HAM_gear_shifts",
-    "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
-    "VER_avg_entry_speed", "HAM_avg_entry_speed",
-    "VER_TyreLife", "HAM_TyreLife",
-    "VER_stint_phase", "HAM_stint_phase",
-    "same_compound", "VER_compound_enc", "HAM_compound_enc",
-    "LapNumber", "race_enc"
-]
 
 # ─────────────────────────────────────────
-# LOAD SPLITS
+# FEATURE COLUMNS
+# Must match data_transformation.py FEATURE_COLS exactly
+# ID and target columns are excluded from model input
 # ─────────────────────────────────────────
 
-def load_splits():
+ID_COLS = ["Race", "RoundNumber", "LapNumber",
+           TARGET_REGRESSION, TARGET_CLASSIFICATION]
+
+# Derived at load time from whatever columns remain after dropping ID_COLS
+def get_feature_cols(df):
+    return [c for c in df.columns if c not in ID_COLS]
+
+
+# ─────────────────────────────────────────
+# LOAD
+# ─────────────────────────────────────────
+
+def load_splits(sc=False):
     try:
-        train = pd.read_csv(TRAIN_PATH)
-        val   = pd.read_csv(VAL_PATH)
-        log.info(f"Train: {train.shape} | Val: {val.shape}")
-        return train, val
+        if sc:
+            train = pd.read_csv(TRAIN_SC_PATH)
+            val   = pd.read_csv(VAL_SC_PATH)
+            test  = pd.read_csv(TEST_SC_PATH)
+            label = "SC"
+        else:
+            train = pd.read_csv(TRAIN_PATH)
+            val   = pd.read_csv(VAL_PATH)
+            test  = pd.read_csv(TEST_PATH)
+            label = "Full"
+
+        log.info(f"[{label}] Loaded — train:{train.shape} val:{val.shape} "
+                 f"test:{test.shape}")
+        return train, val, test
+
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# EVALUATION HELPERS
+# GROUP K-FOLD CV
+# LORO-aware: each race is one group → never mixed across folds
+# Uses Race column as group label
+# ─────────────────────────────────────────
+
+def make_cv_groups(train_df):
+    """Map Race to integer group labels for GroupKFold."""
+    races  = train_df["Race"].values
+    unique = sorted(set(races))
+    race_to_int = {r: i for i, r in enumerate(unique)}
+    return np.array([race_to_int[r] for r in races])
+
+
+def loro_cv_score(model, X_train, y_train, groups, scoring, n_splits=None):
+    """
+    Run GroupKFold CV where each fold holds out one race.
+    n_splits defaults to number of unique groups (true leave-one-race-out).
+    Returns array of per-fold scores.
+    """
+    n_groups = len(set(groups))
+    k = n_splits if n_splits else n_groups
+    gkf = GroupKFold(n_splits=k)
+    scores = cross_val_score(model, X_train, y_train,
+                             cv=gkf, groups=groups,
+                             scoring=scoring, n_jobs=1)
+    return scores
+
+
+# ─────────────────────────────────────────
+# EVALUATE
 # ─────────────────────────────────────────
 
 def eval_regressor(model, X, y, label):
     pred = model.predict(X)
     mae  = mean_absolute_error(y, pred)
-    rmse = mean_squared_error(y, pred) ** 0.5
     r2   = r2_score(y, pred)
-    log.info(f"  [{label}] MAE={mae:.4f}s  RMSE={rmse:.4f}s  R2={r2:.4f}")
-    return {"label": label, "MAE": mae, "RMSE": rmse, "R2": r2}
+    log.info(f"  [{label}] MAE={mae:.4f}s  R²={r2:.4f}")
+    return mae, r2
 
 
 def eval_classifier(model, X, y, label):
-    pred     = model.predict(X)
-    pred_proba = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else pred
+    pred      = model.predict(X)
+    pred_prob = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else pred
     acc  = accuracy_score(y, pred)
     f1   = f1_score(y, pred, zero_division=0)
-    auc  = roc_auc_score(y, pred_proba)
+    auc  = roc_auc_score(y, pred_prob)
     log.info(f"  [{label}] Acc={acc:.4f}  F1={f1:.4f}  AUC={auc:.4f}")
-    return {"label": label, "Accuracy": acc, "F1": f1, "AUC": auc}
-
-
-# ─────────────────────────────────────────
-# AUTO-UPDATE config.py WITH BEST PARAMS
-# ─────────────────────────────────────────
-
-def update_config_best_params(best_reg_params, best_clf_params):
-    """
-    Reads config.py, replaces BEST_REGRESSOR_PARAMS and
-    BEST_CLASSIFIER_PARAMS with the discovered best params.
-    This way config.py is always the single source of truth.
-    """
-    try:
-        config_path = os.path.join(os.getcwd(), "src", "config.py")
-        config_path = os.path.normpath(config_path)
-
-        with open(config_path, "r") as f:
-            content = f.read()
-
-        # Replace BEST_REGRESSOR_PARAMS block
-        new_reg = f"BEST_REGRESSOR_PARAMS = {repr(best_reg_params)}"
-        content = re.sub(
-            r"BEST_REGRESSOR_PARAMS\s*=\s*\{[^}]*\}",
-            new_reg, content, flags=re.DOTALL
-        )
-
-        # Replace BEST_CLASSIFIER_PARAMS block
-        new_clf = f"BEST_CLASSIFIER_PARAMS = {repr(best_clf_params)}"
-        content = re.sub(
-            r"BEST_CLASSIFIER_PARAMS\s*=\s*\{[^}]*\}",
-            new_clf, content, flags=re.DOTALL
-        )
-
-        with open(config_path, "w") as f:
-            f.write(content)
-
-        log.info(f"config.py updated with best params.")
-        log.info(f"  BEST_REGRESSOR_PARAMS  = {best_reg_params}")
-        log.info(f"  BEST_CLASSIFIER_PARAMS = {best_clf_params}")
-
-    except Exception as e:
-        raise CustomException(e, sys)
+    return acc, f1, auc
 
 
 # ─────────────────────────────────────────
 # REGRESSION TRAINING
 # ─────────────────────────────────────────
 
-def train_regressors(X_train, y_train, X_val, y_val):
+def train_regressors(train_df, val_df, sc=False):
     try:
+        label = "SC" if sc else "Full"
         log.info("=" * 60)
-        log.info("REGRESSION MODELS")
+        log.info(f"REGRESSION — {label} dataset")
         log.info("=" * 60)
 
-        results = []
+        feature_cols = get_feature_cols(train_df)
+        X_train = train_df[feature_cols].values
+        y_train = train_df[TARGET_REGRESSION].values
+        X_val   = val_df[feature_cols].values
+        y_val   = val_df[TARGET_REGRESSION].values
+        groups  = make_cv_groups(train_df)
 
-        # ── Baseline ──
+        results = {}
+
+        # ── Baseline ────────────────────────────────────────
+        log.info("\nBaseline — DummyRegressor (mean strategy)")
         dummy = DummyRegressor(strategy="mean")
         dummy.fit(X_train, y_train)
-        results.append(eval_regressor(dummy, X_val, y_val, "Baseline-Mean"))
+        dummy_cv = loro_cv_score(dummy, X_train, y_train, groups,
+                                 scoring="neg_mean_absolute_error")
+        log.info(f"  CV MAE: {-dummy_cv.mean():.4f}s ± {dummy_cv.std():.4f}s")
+        eval_regressor(dummy, X_val, y_val, "Val")
+        results["dummy"] = {"model": dummy, "cv_mae": -dummy_cv.mean()}
 
-        # ── Linear Regression ──
+        # ── Linear models ───────────────────────────────────
+        log.info("\nLinearRegression")
         lr = LinearRegression()
         lr.fit(X_train, y_train)
-        results.append(eval_regressor(lr, X_val, y_val, "LinearRegression"))
-        cv_lr = cross_val_score(lr, X_train, y_train,
-                                cv=5, scoring="neg_mean_absolute_error")
-        log.info(f"  [LinearRegression] CV MAE: {-cv_lr.mean():.4f} ± {cv_lr.std():.4f}")
+        lr_cv = loro_cv_score(lr, X_train, y_train, groups,
+                              scoring="neg_mean_absolute_error")
+        log.info(f"  CV MAE: {-lr_cv.mean():.4f}s ± {lr_cv.std():.4f}s")
+        eval_regressor(lr, X_val, y_val, "Val")
+        results["linear"] = {"model": lr, "cv_mae": -lr_cv.mean()}
 
-        # ── RidgeCV — addresses LinearRegression CV instability ──
-        ridge = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0], cv=5)
+        log.info("\nRidgeCV (alphas=[0.01, 0.1, 1, 10, 100])")
+        ridge = RidgeCV(alphas=[0.01, 0.1, 1, 10, 100], cv=5)
         ridge.fit(X_train, y_train)
-        log.info(f"  RidgeCV selected alpha: {ridge.alpha_}")
-        results.append(eval_regressor(ridge, X_val, y_val, "RidgeCV"))
-        cv_ridge = cross_val_score(ridge, X_train, y_train,
-                                   cv=5, scoring="neg_mean_absolute_error")
-        log.info(f"  [RidgeCV] CV MAE: {-cv_ridge.mean():.4f} ± {cv_ridge.std():.4f}")
+        ridge_cv = loro_cv_score(ridge, X_train, y_train, groups,
+                                 scoring="neg_mean_absolute_error")
+        log.info(f"  Best alpha: {ridge.alpha_:.4f}")
+        log.info(f"  CV MAE: {-ridge_cv.mean():.4f}s ± {ridge_cv.std():.4f}s")
+        eval_regressor(ridge, X_val, y_val, "Val")
+        results["ridge"] = {"model": ridge, "cv_mae": -ridge_cv.mean()}
 
-        # ── LassoCV — feature selection through sparsity ──
-        lasso = LassoCV(alphas=[0.001, 0.01, 0.1, 1.0], cv=5,
-                        max_iter=5000, random_state=42)
+        log.info("\nLassoCV (feature selection insight)")
+        lasso = LassoCV(alphas=[0.001, 0.01, 0.1, 1, 10], cv=5, max_iter=5000)
         lasso.fit(X_train, y_train)
-        n_zero = (lasso.coef_ == 0).sum()
-        log.info(f"  LassoCV selected alpha: {lasso.alpha_:.4f} | "
-                 f"zeroed features: {n_zero}/{len(lasso.coef_)}")
-        results.append(eval_regressor(lasso, X_val, y_val, "LassoCV"))
+        n_nonzero = np.sum(lasso.coef_ != 0)
+        log.info(f"  Best alpha: {lasso.alpha_:.6f}")
+        log.info(f"  Non-zero coefficients: {n_nonzero}/{len(feature_cols)}")
+        lasso_cv = loro_cv_score(lasso, X_train, y_train, groups,
+                                 scoring="neg_mean_absolute_error")
+        log.info(f"  CV MAE: {-lasso_cv.mean():.4f}s ± {lasso_cv.std():.4f}s")
+        eval_regressor(lasso, X_val, y_val, "Val")
+        results["lasso"] = {"model": lasso, "cv_mae": -lasso_cv.mean()}
 
-        # ── RandomForest ──
-        rf_params = INITIAL_MODEL_PARAMS.get("regressor", {})
-        rf = RandomForestRegressor(**rf_params)
-        rf.fit(X_train, y_train)
-        results.append(eval_regressor(rf, X_val, y_val, "RandomForest-Initial"))
+        # Log which features Lasso kept
+        kept = [(feature_cols[i], round(lasso.coef_[i], 4))
+                for i in range(len(feature_cols)) if lasso.coef_[i] != 0]
+        kept_sorted = sorted(kept, key=lambda x: abs(x[1]), reverse=True)
+        log.info(f"  Lasso selected features (sorted by |coef|):")
+        for feat, coef in kept_sorted:
+            log.info(f"    {feat:<40} {coef:+.4f}")
 
-        log.info("  Running RandomizedSearchCV on RandomForest...")
+        # ── RandomForest ────────────────────────────────────
+        log.info("\nRandomForest — RandomizedSearchCV (LORO groups)")
         rf_param_grid = {
-            "n_estimators"    : [50, 100, 200],
-            "max_depth"       : [3, 4, 5, 6, None],
-            "min_samples_leaf": [2, 5, 8, 10],
+            "n_estimators"    : [100, 200, 300],
+            "max_depth"       : [3, 5, 7, None],
+            "min_samples_leaf": [4, 8, 16],
             "max_features"    : ["sqrt", "log2", 0.5],
         }
+        rf_base = RandomForestRegressor(random_state=42, n_jobs=1)
+        n_groups = len(set(groups))
+        gkf = GroupKFold(n_splits=n_groups)
         rf_search = RandomizedSearchCV(
-            RandomForestRegressor(random_state=42),
-            rf_param_grid, n_iter=20, cv=5,
+            rf_base, rf_param_grid,
+            n_iter=20, cv=gkf,
             scoring="neg_mean_absolute_error",
-            random_state=42, n_jobs=1
+            random_state=42, n_jobs=1, verbose=0
         )
-        rf_search.fit(X_train, y_train)
+        rf_search.fit(X_train, y_train, groups=groups)
         best_rf = rf_search.best_estimator_
-        log.info(f"  RF best params: {rf_search.best_params_}")
-        results.append(eval_regressor(best_rf, X_val, y_val, "RandomForest-Tuned"))
+        rf_cv_mae = -rf_search.best_score_
+        log.info(f"  Best params : {rf_search.best_params_}")
+        log.info(f"  CV MAE      : {rf_cv_mae:.4f}s")
+        eval_regressor(best_rf, X_val, y_val, "Val")
+        results["rf"] = {"model": best_rf, "cv_mae": rf_cv_mae}
 
-        # ── XGBoost ──
-        log.info("  Running RandomizedSearchCV on XGBoost...")
+        # ── XGBoost ─────────────────────────────────────────
+        log.info("\nXGBoost — RandomizedSearchCV (LORO groups)")
         xgb_param_grid = {
-            "n_estimators"    : [50, 100, 200],
-            "max_depth"       : [2, 3, 4, 5],
-            "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
-            "subsample"       : [0.6, 0.8, 1.0],
-            "colsample_bytree": [0.6, 0.8, 1.0],
-            "reg_alpha"       : [0, 0.1, 0.5],
-            "reg_lambda"      : [1, 2, 5],
+            "n_estimators"     : [100, 200, 300],
+            "max_depth"        : [3, 4, 5, 6],
+            "learning_rate"    : [0.01, 0.05, 0.1, 0.2],
+            "subsample"        : [0.6, 0.8, 1.0],
+            "colsample_bytree" : [0.6, 0.8, 1.0],
+            "reg_alpha"        : [0, 0.1, 1],
+            "reg_lambda"       : [1, 5, 10],
         }
+        xgb_base = xgb.XGBRegressor(random_state=42, verbosity=0, n_jobs=1)
         xgb_search = RandomizedSearchCV(
-            XGBRegressor(random_state=42, verbosity=0),
-            xgb_param_grid, n_iter=20, cv=5,
+            xgb_base, xgb_param_grid,
+            n_iter=20, cv=gkf,
             scoring="neg_mean_absolute_error",
-            random_state=42, n_jobs=1
+            random_state=42, n_jobs=1, verbose=0
         )
-        xgb_search.fit(X_train, y_train)
+        xgb_search.fit(X_train, y_train, groups=groups)
         best_xgb = xgb_search.best_estimator_
-        log.info(f"  XGB best params: {xgb_search.best_params_}")
-        results.append(eval_regressor(best_xgb, X_val, y_val, "XGBoost-Tuned"))
+        xgb_cv_mae = -xgb_search.best_score_
+        log.info(f"  Best params : {xgb_search.best_params_}")
+        log.info(f"  CV MAE      : {xgb_cv_mae:.4f}s")
+        eval_regressor(best_xgb, X_val, y_val, "Val")
+        results["xgb"] = {"model": best_xgb, "cv_mae": xgb_cv_mae}
 
-        # ── LightGBM — better regularisation for small datasets ──
-        log.info("  Running RandomizedSearchCV on LightGBM...")
-        lgbm_param_grid = {
-            "n_estimators"    : [50, 100, 200],
-            "max_depth"       : [3, 4, 5, 6],
-            "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
-            "num_leaves"      : [15, 31, 63],
-            "min_child_samples": [5, 10, 15, 20],
-            "subsample"       : [0.6, 0.8, 1.0],
-            "reg_alpha"       : [0, 0.1, 0.5],
+        # ── LightGBM ────────────────────────────────────────
+        log.info("\nLightGBM — RandomizedSearchCV (LORO groups)")
+        lgb_param_grid = {
+            "n_estimators"  : [100, 200, 300],
+            "max_depth"     : [3, 4, 5, 6, -1],
+            "learning_rate" : [0.01, 0.05, 0.1, 0.2],
+            "num_leaves"    : [15, 31, 63],
+            "subsample"     : [0.6, 0.8, 1.0],
+            "colsample_bytree": [0.6, 0.8, 1.0],
+            "reg_alpha"     : [0, 0.1, 1],
+            "reg_lambda"    : [1, 5, 10],
         }
-        lgbm_search = RandomizedSearchCV(
-            LGBMRegressor(random_state=42, verbose=-1),
-            lgbm_param_grid, n_iter=20, cv=5,
+        lgb_base = lgb.LGBMRegressor(random_state=42, verbosity=-1, n_jobs=1)
+        lgb_search = RandomizedSearchCV(
+            lgb_base, lgb_param_grid,
+            n_iter=20, cv=gkf,
             scoring="neg_mean_absolute_error",
-            random_state=42, n_jobs=1
+            random_state=42, n_jobs=1, verbose=0
         )
-        lgbm_search.fit(X_train, y_train)
-        best_lgbm = lgbm_search.best_estimator_
-        log.info(f"  LGBM best params: {lgbm_search.best_params_}")
-        results.append(eval_regressor(best_lgbm, X_val, y_val, "LightGBM-Tuned"))
+        lgb_search.fit(X_train, y_train, groups=groups)
+        best_lgb = lgb_search.best_estimator_
+        lgb_cv_mae = -lgb_search.best_score_
+        log.info(f"  Best params : {lgb_search.best_params_}")
+        log.info(f"  CV MAE      : {lgb_cv_mae:.4f}s")
+        eval_regressor(best_lgb, X_val, y_val, "Val")
+        results["lgb"] = {"model": best_lgb, "cv_mae": lgb_cv_mae}
 
-        # ── Pick best by MAE on val (skip dummy) ──
-        best_result = min(results[1:], key=lambda x: x["MAE"])
-        log.info(f"\n  Best regressor on val: {best_result['label']} "
-                 f"| MAE={best_result['MAE']:.4f}s")
+        # ── Select best by CV MAE ────────────────────────────
+        log.info("\n--- REGRESSION SUMMARY (ranked by CV MAE) ---")
+        ranked = sorted(results.items(), key=lambda x: x[1]["cv_mae"])
+        for name, info in ranked:
+            log.info(f"  {name:<10} CV MAE={info['cv_mae']:.4f}s")
 
-        model_map = {
-            "LinearRegression"    : lr,
-            "RidgeCV"             : ridge,
-            "LassoCV"             : lasso,
-            "RandomForest-Initial": rf,
-            "RandomForest-Tuned"  : best_rf,
-            "XGBoost-Tuned"       : best_xgb,
-            "LightGBM-Tuned"      : best_lgbm,
-        }
-        best_reg_model = model_map[best_result["label"]]
+        best_name, best_info = ranked[0]
+        best_model = best_info["model"]
+        log.info(f"\n  Winner: {best_name} (CV MAE={best_info['cv_mae']:.4f}s)")
 
-        if best_result["label"] in ["RandomForest-Tuned", "RandomForest-Initial"]:
-            best_reg_params = rf_search.best_params_
-        elif best_result["label"] == "XGBoost-Tuned":
-            best_reg_params = xgb_search.best_params_
-        elif best_result["label"] == "LightGBM-Tuned":
-            best_reg_params = lgbm_search.best_params_
-        elif best_result["label"] == "RidgeCV":
-            best_reg_params = {"alpha": ridge.alpha_}
-        elif best_result["label"] == "LassoCV":
-            best_reg_params = {"alpha": lasso.alpha_}
-        else:
-            best_reg_params = {}
-
-        return best_reg_model, best_reg_params, results
+        return best_model, results
 
     except Exception as e:
         raise CustomException(e, sys)
+
 
 # ─────────────────────────────────────────
 # CLASSIFICATION TRAINING
 # ─────────────────────────────────────────
 
-def train_classifiers(X_train, y_train, X_val, y_val):
+def train_classifiers(train_df, val_df, sc=False):
     try:
+        label = "SC" if sc else "Full"
         log.info("=" * 60)
-        log.info("CLASSIFICATION MODELS")
+        log.info(f"CLASSIFICATION — {label} dataset")
         log.info("=" * 60)
 
-        results = []
+        feature_cols = get_feature_cols(train_df)
+        X_train = train_df[feature_cols].values
+        y_train = train_df[TARGET_CLASSIFICATION].values
+        X_val   = val_df[feature_cols].values
+        y_val   = val_df[TARGET_CLASSIFICATION].values
+        groups  = make_cv_groups(train_df)
+        n_groups = len(set(groups))
+        gkf = GroupKFold(n_splits=n_groups)
 
-        # ── Baseline ──
-        dummy = DummyClassifier(strategy="most_frequent")
+        results = {}
+
+        # ── Baseline ────────────────────────────────────────
+        log.info("\nBaseline — DummyClassifier (most_frequent)")
+        dummy = DummyClassifier(strategy="most_frequent", random_state=42)
         dummy.fit(X_train, y_train)
-        results.append(eval_classifier(dummy, X_val, y_val, "Baseline-MostFrequent"))
+        dummy_cv = loro_cv_score(dummy, X_train, y_train, groups,
+                                 scoring="roc_auc")
+        log.info(f"  CV AUC: {dummy_cv.mean():.4f} ± {dummy_cv.std():.4f}")
+        eval_classifier(dummy, X_val, y_val, "Val")
+        results["dummy"] = {"model": dummy, "cv_auc": dummy_cv.mean()}
 
-        # ── Logistic Regression ──
-        clf_params = INITIAL_MODEL_PARAMS.get("classifier", {})
-        lr = LogisticRegression(**clf_params)
+        # ── Logistic Regression ─────────────────────────────
+        log.info("\nLogisticRegression")
+        lr = LogisticRegression(
+            C=INITIAL_MODEL_PARAMS["classifier"]["C"],
+            max_iter=INITIAL_MODEL_PARAMS["classifier"]["max_iter"],
+            random_state=42
+        )
         lr.fit(X_train, y_train)
-        results.append(eval_classifier(lr, X_val, y_val, "LogisticRegression"))
+        lr_cv = loro_cv_score(lr, X_train, y_train, groups, scoring="roc_auc")
+        log.info(f"  CV AUC: {lr_cv.mean():.4f} ± {lr_cv.std():.4f}")
+        eval_classifier(lr, X_val, y_val, "Val")
+        results["logistic"] = {"model": lr, "cv_auc": lr_cv.mean()}
 
-        cv_scores = cross_val_score(lr, X_train, y_train, cv=5, scoring="f1")
-        log.info(f"  [LogisticRegression] CV F1: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-
-        # ── RandomForest with class_weight balanced ──
-        log.info("  Running RandomizedSearchCV on RandomForest (balanced)...")
+        # ── RandomForest ────────────────────────────────────
+        log.info("\nRandomForest classifier — RandomizedSearchCV (LORO groups)")
         rf_param_grid = {
-            "n_estimators"    : [50, 100, 200],
-            "max_depth"       : [3, 4, 5, 6, None],
-            "min_samples_leaf": [2, 5, 8, 10],
+            "n_estimators"    : [100, 200, 300],
+            "max_depth"       : [3, 5, 7, None],
+            "min_samples_leaf": [4, 8, 16],
             "max_features"    : ["sqrt", "log2", 0.5],
         }
+        rf_base = RandomForestClassifier(random_state=42, class_weight="balanced",
+                                         n_jobs=1)
         rf_search = RandomizedSearchCV(
-            RandomForestClassifier(class_weight="balanced", random_state=42),
-            rf_param_grid, n_iter=20, cv=5,
-            scoring="f1", random_state=42, n_jobs=1
+            rf_base, rf_param_grid,
+            n_iter=20, cv=gkf,
+            scoring="roc_auc",
+            random_state=42, n_jobs=1, verbose=0
         )
-        rf_search.fit(X_train, y_train)
+        rf_search.fit(X_train, y_train, groups=groups)
         best_rf = rf_search.best_estimator_
-        log.info(f"  RF best params: {rf_search.best_params_}")
-        results.append(eval_classifier(best_rf, X_val, y_val, "RandomForest-Tuned"))
+        rf_cv_auc = rf_search.best_score_
+        log.info(f"  Best params : {rf_search.best_params_}")
+        log.info(f"  CV AUC      : {rf_cv_auc:.4f}")
+        eval_classifier(best_rf, X_val, y_val, "Val")
+        results["rf"] = {"model": best_rf, "cv_auc": rf_cv_auc}
 
-        # ── XGBoost with scale_pos_weight for imbalance ──
-        scale_pos = (y_train == 0).sum() / (y_train == 1).sum()
-        log.info(f"  XGBoost scale_pos_weight = {scale_pos:.2f}")
-        log.info("  Running RandomizedSearchCV on XGBoost...")
+        # ── XGBoost ─────────────────────────────────────────
+        log.info("\nXGBoost classifier — RandomizedSearchCV (LORO groups)")
         xgb_param_grid = {
-            "n_estimators"    : [50, 100, 200],
-            "max_depth"       : [2, 3, 4, 5],
+            "n_estimators"    : [100, 200, 300],
+            "max_depth"       : [3, 4, 5, 6],
             "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
             "subsample"       : [0.6, 0.8, 1.0],
             "colsample_bytree": [0.6, 0.8, 1.0],
-            "reg_alpha"       : [0, 0.1, 0.5],
-            "reg_lambda"      : [1, 2, 5],
+            "reg_alpha"       : [0, 0.1, 1],
+            "reg_lambda"      : [1, 5, 10],
         }
+        scale_pos = int((y_train == 0).sum()) / int((y_train == 1).sum())
+        xgb_base = xgb.XGBClassifier(random_state=42, verbosity=0,
+                                      scale_pos_weight=scale_pos, n_jobs=1,
+                                      eval_metric="auc")
         xgb_search = RandomizedSearchCV(
-            XGBClassifier(scale_pos_weight=scale_pos,
-                          random_state=42, verbosity=0,
-                          eval_metric="logloss"),
-            xgb_param_grid, n_iter=20, cv=5,
-            scoring="f1", random_state=42, n_jobs=1
+            xgb_base, xgb_param_grid,
+            n_iter=20, cv=gkf,
+            scoring="roc_auc",
+            random_state=42, n_jobs=1, verbose=0
         )
-        xgb_search.fit(X_train, y_train)
+        xgb_search.fit(X_train, y_train, groups=groups)
         best_xgb = xgb_search.best_estimator_
-        log.info(f"  XGB best params: {xgb_search.best_params_}")
-        results.append(eval_classifier(best_xgb, X_val, y_val, "XGBoost-Tuned"))
+        xgb_cv_auc = xgb_search.best_score_
+        log.info(f"  Best params : {xgb_search.best_params_}")
+        log.info(f"  CV AUC      : {xgb_cv_auc:.4f}")
+        eval_classifier(best_xgb, X_val, y_val, "Val")
+        results["xgb"] = {"model": best_xgb, "cv_auc": xgb_cv_auc}
 
-        # ── Pick best by F1 on val (skip dummy) ──
-        best_result = max(results[1:], key=lambda x: x["F1"])
-        log.info(f"\n  Best classifier on val: {best_result['label']} "
-                 f"| F1={best_result['F1']:.4f}  AUC={best_result['AUC']:.4f}")
-
-        model_map = {
-            "LogisticRegression"  : lr,
-            "RandomForest-Tuned"  : best_rf,
-            "XGBoost-Tuned"       : best_xgb,
+        # ── LightGBM ────────────────────────────────────────
+        log.info("\nLightGBM classifier — RandomizedSearchCV (LORO groups)")
+        lgb_param_grid = {
+            "n_estimators"    : [100, 200, 300],
+            "max_depth"       : [3, 4, 5, 6, -1],
+            "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
+            "num_leaves"      : [15, 31, 63],
+            "subsample"       : [0.6, 0.8, 1.0],
+            "colsample_bytree": [0.6, 0.8, 1.0],
+            "reg_alpha"       : [0, 0.1, 1],
+            "reg_lambda"      : [1, 5, 10],
         }
-        best_clf_model  = model_map[best_result["label"]]
-        best_clf_params = (rf_search.best_params_
-                           if "RandomForest" in best_result["label"]
-                           else xgb_search.best_params_
-                           if "XGBoost" in best_result["label"]
-                           else {})
+        lgb_base = lgb.LGBMClassifier(random_state=42, verbosity=-1,
+                                       class_weight="balanced", n_jobs=1)
+        lgb_search = RandomizedSearchCV(
+            lgb_base, lgb_param_grid,
+            n_iter=20, cv=gkf,
+            scoring="roc_auc",
+            random_state=42, n_jobs=1, verbose=0
+        )
+        lgb_search.fit(X_train, y_train, groups=groups)
+        best_lgb = lgb_search.best_estimator_
+        lgb_cv_auc = lgb_search.best_score_
+        log.info(f"  Best params : {lgb_search.best_params_}")
+        log.info(f"  CV AUC      : {lgb_cv_auc:.4f}")
+        eval_classifier(best_lgb, X_val, y_val, "Val")
+        results["lgb"] = {"model": best_lgb, "cv_auc": lgb_cv_auc}
 
-        return best_clf_model, best_clf_params, results
+        # ── Select best by CV AUC ────────────────────────────
+        log.info("\n--- CLASSIFICATION SUMMARY (ranked by CV AUC) ---")
+        ranked = sorted(results.items(), key=lambda x: x[1]["cv_auc"], reverse=True)
+        for name, info in ranked:
+            log.info(f"  {name:<10} CV AUC={info['cv_auc']:.4f}")
 
+        best_name, best_info = ranked[0]
+        best_model = best_info["model"]
+        log.info(f"\n  Winner: {best_name} (CV AUC={best_info['cv_auc']:.4f})")
+
+        return best_model, results
+
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# SAVE MODELS
+# ─────────────────────────────────────────
+
+def save_model(model, path):
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(model, f)
+        log.info(f"  Saved → {path}")
     except Exception as e:
         raise CustomException(e, sys)
 
@@ -369,67 +439,39 @@ def train_classifiers(X_train, y_train, X_val, y_val):
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-def run_model_trainer():
+
+def run_training():
     try:
         log.info("=" * 60)
-        log.info("Starting model training")
+        log.info("Starting model training — Phase 2")
+        log.info("Primary metric: CV MAE (regression), CV AUC (classification)")
+        log.info("CV strategy   : Leave-One-Race-Out (GroupKFold by Race)")
         log.info("=" * 60)
 
-        # ── FULL DATASET ──
-        log.info("\n>>> FULL DATASET (all compound combinations)")
-        train, val = load_splits()
-        X_train = train[FEATURE_COLS].values
-        X_val   = val[FEATURE_COLS].values
-        y_train_reg = train[TARGET_REGRESSION].values
-        y_val_reg   = val[TARGET_REGRESSION].values
-        y_train_clf = train[TARGET_CLASSIFICATION].values
-        y_val_clf   = val[TARGET_CLASSIFICATION].values
+        # ── Full dataset ─────────────────────────────────────
+        log.info("\n>>> FULL DATASET")
+        train_df, val_df, test_df = load_splits(sc=False)
 
-        best_reg, best_reg_params, reg_results = train_regressors(
-            X_train, y_train_reg, X_val, y_val_reg
-        )
-        best_clf, best_clf_params, clf_results = train_classifiers(
-            X_train, y_train_clf, X_val, y_val_clf
-        )
-        update_config_best_params(best_reg_params, best_clf_params)
+        best_reg,  reg_results  = train_regressors(train_df, val_df, sc=False)
+        best_clf,  clf_results  = train_classifiers(train_df, val_df, sc=False)
 
-        with open(REGRESSOR_PATH, "wb") as f:
-            pickle.dump(best_reg, f)
-        log.info(f"Full regressor saved → {REGRESSOR_PATH}")
+        save_model(best_reg, REGRESSOR_PATH)
+        save_model(best_clf, CLASSIFIER_PATH)
 
-        with open(CLASSIFIER_PATH, "wb") as f:
-            pickle.dump(best_clf, f)
-        log.info(f"Full classifier saved → {CLASSIFIER_PATH}")
+        # ── SC dataset ──────────────────────────────────────
+        log.info("\n>>> SAME-COMPOUND DATASET")
+        sc_train_df, sc_val_df, sc_test_df = load_splits(sc=True)
 
-        # ── SAME-COMPOUND SUBSET ──
-        log.info("\n>>> SAME-COMPOUND SUBSET (driving style isolated)")
-        train_sc = pd.read_csv(TRAIN_SC_PATH)
-        val_sc   = pd.read_csv(VAL_SC_PATH)
-        log.info(f"SC Train: {train_sc.shape} | SC Val: {val_sc.shape}")
+        best_reg_sc, reg_sc_results = train_regressors(sc_train_df, sc_val_df, sc=True)
+        best_clf_sc, clf_sc_results = train_classifiers(sc_train_df, sc_val_df, sc=True)
 
-        X_train_sc = train_sc[FEATURE_COLS].values
-        X_val_sc   = val_sc[FEATURE_COLS].values
-        y_train_sc_reg = train_sc[TARGET_REGRESSION].values
-        y_val_sc_reg   = val_sc[TARGET_REGRESSION].values
-        y_train_sc_clf = train_sc[TARGET_CLASSIFICATION].values
-        y_val_sc_clf   = val_sc[TARGET_CLASSIFICATION].values
+        save_model(best_reg_sc, REGRESSOR_SC_PATH)
+        save_model(best_clf_sc, CLASSIFIER_SC_PATH)
 
-        best_reg_sc, best_reg_sc_params, reg_sc_results = train_regressors(
-            X_train_sc, y_train_sc_reg, X_val_sc, y_val_sc_reg
-        )
-        best_clf_sc, best_clf_sc_params, clf_sc_results = train_classifiers(
-            X_train_sc, y_train_sc_clf, X_val_sc, y_val_sc_clf
-        )
+        log.info("\n" + "=" * 60)
+        log.info("Model training complete. 4 models saved.")
+        log.info("=" * 60)
 
-        # Save SC models separately
-        with open(REGRESSOR_SC_PATH,  "wb") as f:
-            pickle.dump(best_reg_sc, f)
-        with open(CLASSIFIER_SC_PATH, "wb") as f:
-            pickle.dump(best_clf_sc, f)
-        log.info(f"SC Regressor  saved → {REGRESSOR_SC_PATH}")
-        log.info(f"SC Classifier saved → {CLASSIFIER_SC_PATH}")
-
-        log.info("Model training complete.")
         return (best_reg, best_clf, reg_results, clf_results,
                 best_reg_sc, best_clf_sc, reg_sc_results, clf_sc_results)
 
@@ -439,28 +481,69 @@ def run_model_trainer():
 
 if __name__ == "__main__":
     (best_reg, best_clf, reg_results, clf_results,
-     best_reg_sc, best_clf_sc, reg_sc_results, clf_sc_results) = run_model_trainer()
+     best_reg_sc, best_clf_sc, reg_sc_results, clf_sc_results) = run_training()
 
-    print("\n--- FULL DATASET — REGRESSION ---")
-    print(f"{'Model':<30} {'MAE':>8} {'RMSE':>8} {'R2':>8}")
-    print("-" * 58)
-    for r in reg_results:
-        print(f"{r['label']:<30} {r['MAE']:>8.4f} {r['RMSE']:>8.4f} {r['R2']:>8.4f}")
+    # ── Final val comparison table ───────────────────────────
+    log.info("\n" + "=" * 60)
+    log.info("FINAL MODEL COMPARISON — VAL SET")
+    log.info("=" * 60)
 
-    print("\n--- FULL DATASET — CLASSIFICATION ---")
-    print(f"{'Model':<30} {'Accuracy':>10} {'F1':>8} {'AUC':>8}")
-    print("-" * 60)
-    for r in clf_results:
-        print(f"{r['label']:<30} {r['Accuracy']:>10.4f} {r['F1']:>8.4f} {r['AUC']:>8.4f}")
+    train_df, val_df, _   = load_splits(sc=False)
+    sc_train_df, sc_val_df, _ = load_splits(sc=True)
 
-    print("\n--- SAME-COMPOUND SUBSET — REGRESSION ---")
-    print(f"{'Model':<30} {'MAE':>8} {'RMSE':>8} {'R2':>8}")
-    print("-" * 58)
-    for r in reg_sc_results:
-        print(f"{r['label']:<30} {r['MAE']:>8.4f} {r['RMSE']:>8.4f} {r['R2']:>8.4f}")
+    feature_cols    = get_feature_cols(train_df)
+    feature_cols_sc = get_feature_cols(sc_train_df)
 
-    print("\n--- SAME-COMPOUND SUBSET — CLASSIFICATION ---")
-    print(f"{'Model':<30} {'Accuracy':>10} {'F1':>8} {'AUC':>8}")
-    print("-" * 60)
-    for r in clf_sc_results:
-        print(f"{r['label']:<30} {r['Accuracy']:>10.4f} {r['F1']:>8.4f} {r['AUC']:>8.4f}")
+    X_val    = val_df[feature_cols].values
+    y_val_r  = val_df[TARGET_REGRESSION].values
+    y_val_c  = val_df[TARGET_CLASSIFICATION].values
+
+    X_sc_val    = sc_val_df[feature_cols_sc].values
+    y_sc_val_r  = sc_val_df[TARGET_REGRESSION].values
+    y_sc_val_c  = sc_val_df[TARGET_CLASSIFICATION].values
+
+    log.info("\n[FULL — Regression] Val MAE / R²")
+    for name, info in sorted(reg_results.items(),
+                              key=lambda x: x[1]["cv_mae"]):
+        m = info["model"]
+        mae, r2 = mean_absolute_error(y_val_r, m.predict(X_val)), \
+                  r2_score(y_val_r, m.predict(X_val))
+        log.info(f"  {name:<10}  CV_MAE={info['cv_mae']:.4f}  "
+              f"Val_MAE={mae:.4f}  Val_R²={r2:.4f}")
+
+    log.info("\n[FULL — Classification] Val AUC / F1")
+    for name, info in sorted(clf_results.items(),
+                              key=lambda x: x[1]["cv_auc"], reverse=True):
+        m = info["model"]
+        pred_prob = m.predict_proba(X_val)[:, 1] \
+                    if hasattr(m, "predict_proba") else m.predict(X_val)
+        auc = roc_auc_score(y_val_c, pred_prob)
+        f1  = f1_score(y_val_c, m.predict(X_val), zero_division=0)
+        log.info(f"  {name:<10}  CV_AUC={info['cv_auc']:.4f}  "
+              f"Val_AUC={auc:.4f}  Val_F1={f1:.4f}")
+
+    log.info("\n[SC — Regression] Val MAE / R²")
+    for name, info in sorted(reg_sc_results.items(),
+                              key=lambda x: x[1]["cv_mae"]):
+        m = info["model"]
+        mae, r2 = mean_absolute_error(y_sc_val_r, m.predict(X_sc_val)), \
+                  r2_score(y_sc_val_r, m.predict(X_sc_val))
+        log.info(f"  {name:<10}  CV_MAE={info['cv_mae']:.4f}  "
+              f"Val_MAE={mae:.4f}  Val_R²={r2:.4f}")
+
+    log.info("\n[SC — Classification] Val AUC / F1")
+    for name, info in sorted(clf_sc_results.items(),
+                              key=lambda x: x[1]["cv_auc"], reverse=True):
+        m = info["model"]
+        pred_prob = m.predict_proba(X_sc_val)[:, 1] \
+                    if hasattr(m, "predict_proba") else m.predict(X_sc_val)
+        auc = roc_auc_score(y_sc_val_c, pred_prob)
+        f1  = f1_score(y_sc_val_c, m.predict(X_sc_val), zero_division=0)
+        log.info(f"  {name:<10}  CV_AUC={info['cv_auc']:.4f}  "
+              f"Val_AUC={auc:.4f}  Val_F1={f1:.4f}")
+
+    log.info("\nModels saved:")
+    log.info(f"  regressor.pkl    → best full regression model")
+    log.info(f"  classifier.pkl   → best full classification model")
+    log.info(f"  regressor_sc.pkl → best SC regression model")
+    log.info(f"  classifier_sc.pkl→ best SC classification model")
