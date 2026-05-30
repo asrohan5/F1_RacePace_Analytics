@@ -278,11 +278,6 @@ def engineer_features(paired):
         # Race encoding — use RoundNumber as integer (1-22)
         df["race_enc"] = df["RoundNumber"]
 
-        # abu_dhabi_gear_delta — gear shift delta scaled to Abu Dhabi round
-        # 1 for AbuDhabi rows, 0 elsewhere (race-specific interaction term)
-        abu_dhabi_round = df["Race"] == TEST_RACE
-        df["abu_dhabi_gear_delta"] = df["gear_shifts_delta"] * abu_dhabi_round.astype(int)
-
         # Compound encoding
         compound_map = {"SOFT": 0, "MEDIUM": 1, "HARD": 2,
                         "INTERMEDIATE": 3, "WET": 4}
@@ -340,17 +335,29 @@ def engineer_features(paired):
         df[TARGET_REGRESSION]     = df["VER_LapTimeSec"] - df["HAM_LapTimeSec"]
         df[TARGET_CLASSIFICATION] = (df[TARGET_REGRESSION] < 0).astype(int)
 
-        # ── rolling_delta_3: 3-lap rolling mean of target ────
-        # MUST be computed before split to avoid leakage (uses historical laps)
-        # Sort by Race + LapNumber so rolling is temporal within race
+        # ── lap_race_position: normalised lap number within each race ────
+        # Replaces rolling_delta_3 which encoded the target directly and
+        # prevented generalisation to unseen races.
+        # Captures race phase (early/mid/late) without any leakage.
         df = df.sort_values(["Race", "LapNumber"]).reset_index(drop=True)
-        df["rolling_delta_3"] = (
-            df.groupby("Race")[TARGET_REGRESSION]
+        df["lap_race_position"] = (
+            df.groupby("Race")["LapNumber"]
+            .transform(lambda x: (x - x.min()) / (x.max() - x.min() + 1e-6))
+        )
+
+        # ── sc_rolling_delta_3: 3-lap rolling mean of target ─────────
+        # Only computed on same-compound laps — on mixed-compound laps
+        # tyre context already explains the delta so this adds noise.
+        # shift(1) ensures no current-lap leakage.
+        # NaNs (first 1-3 laps of each race) filled with 0 (neutral prior).
+        sc_mask = df["VER_Compound"] == df["HAM_Compound"]
+        df["sc_rolling_delta_3"] = np.nan
+        df.loc[sc_mask, "sc_rolling_delta_3"] = (
+            df[sc_mask]
+            .groupby("Race")[TARGET_REGRESSION]
             .transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
         )
-        # Fill NaN on first 1-3 laps of each race with the race mean target
-        race_mean = df.groupby("Race")[TARGET_REGRESSION].transform("mean")
-        df["rolling_delta_3"] = df["rolling_delta_3"].fillna(race_mean)
+        df["sc_rolling_delta_3"] = df["sc_rolling_delta_3"].fillna(0.0)
 
         log.info(f"Features engineered. Shape: {df.shape}")
         return df
@@ -364,7 +371,7 @@ def engineer_features(paired):
 # ─────────────────────────────────────────
 
 FEATURE_COLS = [
-    # Delta features
+    # ── Delta features (relative VER vs HAM) ────────────────
     "coasting_pct_delta",
     "full_throttle_pct_delta",
     "gear_shifts_delta",
@@ -374,25 +381,31 @@ FEATURE_COLS = [
     "tyre_life_delta",
     "tyre_life_x_coasting_delta",
     "stint_phase_delta",
-    "abu_dhabi_gear_delta",
-    "rolling_delta_3",
 
-    # Individual driver features
-    "VER_coasting_pct", "HAM_coasting_pct",
-    "VER_full_throttle_pct", "HAM_full_throttle_pct",
-    "VER_gear_shifts", "HAM_gear_shifts",
-    "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
-    "VER_avg_entry_speed", "HAM_avg_entry_speed",
+    # ── Race phase (replaces leaky rolling_delta_3) ──────────
+    "lap_race_position",
+
+    # ── Same-compound rolling delta (SC-safe momentum signal) ─
+    # Computed only on same-compound laps; zero elsewhere.
+    # shift(1) applied — no current-lap leakage.
+    "sc_rolling_delta_3",
+
+    # ── Tyre context — absolute values needed for degradation ─
+    # (raw coasting/throttle removed: correlated with style features below)
     "VER_TyreLife", "HAM_TyreLife",
     "VER_stint_phase", "HAM_stint_phase",
+    "VER_gear_shifts", "HAM_gear_shifts",
+    "VER_avg_entry_speed", "HAM_avg_entry_speed",
 
-    # Phase 2 — car context
+    # ── Phase 2 — car context ────────────────────────────────
     "VER_upgrade_level",
     "HAM_upgrade_level",
     "upgrade_delta",
     "is_low_sample",
 
-    # Phase 2 — teammate normalised style
+    # ── Phase 2 — teammate normalised style ──────────────────
+    # These replace raw VER_coasting_pct, VER_full_throttle_pct etc.
+    # which are collinear with these by construction.
     "VER_style_coasting",
     "HAM_style_coasting",
     "style_coasting_delta",
@@ -403,11 +416,10 @@ FEATURE_COLS = [
     "HAM_style_full_throttle",
     "style_throttle_delta",
 
-    # Contextual
+    # ── Contextual ───────────────────────────────────────────
     "same_compound",
     "VER_compound_enc",
     "HAM_compound_enc",
-    "LapNumber",
     "race_enc",
 ]
 
@@ -641,30 +653,30 @@ if __name__ == "__main__":
      sc_train, sc_val, sc_test,
      scaler) = run_transformation()
 
-    print("\n--- FULL DATASET ---")
-    print(f"Total rows    : {len(features_df)}")
-    print(f"Train rows    : {len(train)}")
-    print(f"Val rows      : {len(val)}")
-    print(f"Test rows     : {len(test)}")
-    print(f"Races in train: {sorted(train['Race'].unique())}")
-    print(f"Target mean   : {features_df[TARGET_REGRESSION].mean():.3f}s")
-    print(f"Target std    : {features_df[TARGET_REGRESSION].std():.3f}s")
-    print(f"Class balance : {features_df[TARGET_CLASSIFICATION].mean():.2%} VER faster")
+    log.info("\n--- FULL DATASET ---")
+    log.info(f"Total rows    : {len(features_df)}")
+    log.info(f"Train rows    : {len(train)}")
+    log.info(f"Val rows      : {len(val)}")
+    log.info(f"Test rows     : {len(test)}")
+    log.info(f"Races in train: {sorted(train['Race'].unique())}")
+    log.info(f"Target mean   : {features_df[TARGET_REGRESSION].mean():.3f}s")
+    log.info(f"Target std    : {features_df[TARGET_REGRESSION].std():.3f}s")
+    log.info(f"Class balance : {features_df[TARGET_CLASSIFICATION].mean():.2%} VER faster")
 
-    print("\n--- SC DATASET ---")
-    print(f"Total SC rows : {len(sc_df)}")
-    print(f"SC Train rows : {len(sc_train)}")
-    print(f"SC Val rows   : {len(sc_val)}")
-    print(f"SC Test rows  : {len(sc_test)}")
-    print(f"Races in SC   : {sorted(sc_df['Race'].unique())}")
+    log.info("\n--- SC DATASET ---")
+    log.info(f"Total SC rows : {len(sc_df)}")
+    log.info(f"SC Train rows : {len(sc_train)}")
+    log.info(f"SC Val rows   : {len(sc_val)}")
+    log.info(f"SC Test rows  : {len(sc_test)}")
+    log.info(f"Races in SC   : {sorted(sc_df['Race'].unique())}")
 
-    print("\n--- FEATURE NULLS (full, unscaled) ---")
+    log.info("\n--- FEATURE NULLS (full, unscaled) ---")
     null_counts = features_df.isnull().sum()
-    print(null_counts[null_counts > 0].to_string()
+    log.info(null_counts[null_counts > 0].to_string()
           if null_counts.any() else "No nulls.")
 
-    print("\n--- SPLIT SANITY CHECK ---")
-    print("No race appears in more than one split:")
+    log.info("\n--- SPLIT SANITY CHECK ---")
+    log.info("No race appears in more than one split:")
     all_splits = {
         "train": set(train["Race"].unique()),
         "val"  : set(val["Race"].unique()),
@@ -676,4 +688,4 @@ if __name__ == "__main__":
         "val∩test"  : all_splits["val"]   & all_splits["test"],
     }
     for k, v in overlaps.items():
-        print(f"  {k}: {v if v else 'CLEAN'}")
+        log.info(f"  {k}: {v if v else 'CLEAN'}")

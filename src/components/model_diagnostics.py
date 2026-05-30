@@ -1,72 +1,100 @@
+"""
+model_diagnostics.py — Phase 2
+================================
+Deeper analysis beyond validation metrics:
+
+1.  SHAP values — global and per-driver
+2.  Partial dependence plots — top features
+3.  Calibration curve — classifier probability reliability
+4.  Overfitting profile — train/val/test MAE and AUC with annotations
+5.  Bias decomposition — by upgrade era and compound
+6.  Per-race classifier accuracy — where does the model fail?
+7.  Prediction interval width — regression uncertainty by tyre life
+8.  Feature correlation heatmap — multicollinearity audit
+9.  Rolling accuracy — classifier confidence across Abu Dhabi race
+10. Championship narrative plot — season-long VER vs HAM delta with
+    upgrade markers and model predictions overlaid
+"""
+
 import os
 import sys
 import pickle
+import warnings
+warnings.filterwarnings("ignore")
+
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-
-from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error, r2_score,
-    confusion_matrix, roc_curve, auc, ConfusionMatrixDisplay
-)
-from sklearn.model_selection import KFold, StratifiedKFold
+import matplotlib.patches as mpatches
+import seaborn as sns
 import shap
+
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import (
+    mean_absolute_error, accuracy_score, roc_auc_score
+)
 
 from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
     TRAIN_PATH, VAL_PATH, TEST_PATH,
     TRAIN_SC_PATH, VAL_SC_PATH, TEST_SC_PATH,
+    FEATURES_PATH, FEATURES_SAME_COMPOUND_PATH,
     REGRESSOR_PATH, CLASSIFIER_PATH,
     REGRESSOR_SC_PATH, CLASSIFIER_SC_PATH,
-    FEATURES_PATH, FEATURES_SAME_COMPOUND_PATH,
     ARTIFACTS_DIR,
-    TARGET_REGRESSION, TARGET_CLASSIFICATION
+    TARGET_REGRESSION, TARGET_CLASSIFICATION,
+    VER_UPGRADE_ROUNDS, HAM_UPGRADE_ROUNDS,
+    RACES,
 )
-import warnings
-warnings.filterwarnings('ignore')
 
+# ─────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────
+DIAG_DIR = os.path.join(ARTIFACTS_DIR, "diagnostic_plots")
+os.makedirs(DIAG_DIR, exist_ok=True)
 
+ID_COLS = ["Race", "RoundNumber", "LapNumber",
+           TARGET_REGRESSION, TARGET_CLASSIFICATION]
 
-FEATURE_COLS = [
-    "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
-    "avg_brake_zone_length_delta", "avg_entry_speed_delta",
-    "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
-    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
-    "VER_coasting_pct", "HAM_coasting_pct",
-    "VER_full_throttle_pct", "HAM_full_throttle_pct",
-    "VER_gear_shifts", "HAM_gear_shifts",
-    "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
-    "VER_avg_entry_speed", "HAM_avg_entry_speed",
-    "VER_TyreLife", "HAM_TyreLife",
-    "VER_stint_phase", "HAM_stint_phase",
-    "same_compound", "VER_compound_enc", "HAM_compound_enc",
-    "LapNumber", "race_enc"
-]
+def get_feature_cols(df):
+    return [c for c in df.columns if c not in ID_COLS]
 
-FEATURE_LABELS = [
-    "Coasting % Delta",         "Full Throttle % Delta",    "Gear Shifts Delta",
-    "Brake Zone Length Delta",  "Entry Speed Delta",         "Brake Zone Count Delta",
-    "Tyre Life Delta",          "TyreLife x Coasting Delta",
-    "Stint Phase Delta",        "AbuDhabi Gear Delta",       "Rolling Delta 3",
-    "VER Coasting %",           "HAM Coasting %",
-    "VER Full Throttle %",      "HAM Full Throttle %",
-    "VER Gear Shifts",          "HAM Gear Shifts",
-    "VER Brake Zone Length",    "HAM Brake Zone Length",
-    "VER Entry Speed",          "HAM Entry Speed",
-    "VER Tyre Life",            "HAM Tyre Life",
-    "VER Stint Phase",          "HAM Stint Phase",
-    "Same Compound",            "VER Compound",              "HAM Compound",
-    "Lap Number",               "Race"
-]
+def save_fig(filename):
+    path = os.path.join(DIAG_DIR, filename)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"  Saved: {filename}")
 
-def save_fig(fig, filename):
-    path = os.path.join(ARTIFACTS_DIR, filename)
-    fig.savefig(path, bbox_inches="tight", dpi=130)
-    plt.close(fig)
-    log.info(f"Plot saved → {path}")
+# ─────────────────────────────────────────
+# STYLE
+# ─────────────────────────────────────────
+plt.rcParams.update({
+    "figure.facecolor" : "#0f0f0f",
+    "axes.facecolor"   : "#1a1a1a",
+    "axes.edgecolor"   : "#444444",
+    "axes.labelcolor"  : "#cccccc",
+    "axes.titlecolor"  : "#ffffff",
+    "xtick.color"      : "#888888",
+    "ytick.color"      : "#888888",
+    "text.color"       : "#cccccc",
+    "grid.color"       : "#2a2a2a",
+    "grid.linewidth"   : 0.6,
+    "font.size"        : 10,
+    "axes.titlesize"   : 12,
+    "axes.labelsize"   : 10,
+    "legend.framealpha": 0.3,
+    "legend.edgecolor" : "#444444",
+})
 
+VER_COLOR = "#3671C6"
+HAM_COLOR = "#00D2BE"
+NEUTRAL   = "#e8e8e8"
+ACCENT    = "#ff6b35"
+GREY      = "#555555"
+GREEN     = "#44bb77"
 
 # ─────────────────────────────────────────
 # LOAD
@@ -77,604 +105,577 @@ def load_all():
         train    = pd.read_csv(TRAIN_PATH)
         val      = pd.read_csv(VAL_PATH)
         test     = pd.read_csv(TEST_PATH)
-        train_sc = pd.read_csv(TRAIN_SC_PATH)
-        val_sc   = pd.read_csv(VAL_SC_PATH)
-        test_sc  = pd.read_csv(TEST_SC_PATH)
+        sc_train = pd.read_csv(TRAIN_SC_PATH)
+        sc_val   = pd.read_csv(VAL_SC_PATH)
+        sc_test  = pd.read_csv(TEST_SC_PATH)
+
+        # Raw (unscaled) for contextual analysis
+        feat_raw    = pd.read_csv(FEATURES_PATH)
+        feat_sc_raw = pd.read_csv(FEATURES_SAME_COMPOUND_PATH)
 
         with open(REGRESSOR_PATH,     "rb") as f: reg    = pickle.load(f)
         with open(CLASSIFIER_PATH,    "rb") as f: clf    = pickle.load(f)
         with open(REGRESSOR_SC_PATH,  "rb") as f: reg_sc = pickle.load(f)
         with open(CLASSIFIER_SC_PATH, "rb") as f: clf_sc = pickle.load(f)
 
-        log.info(f"Full  — Train={train.shape} Val={val.shape} Test={test.shape}")
-        log.info(f"SC    — Train={train_sc.shape} Val={val_sc.shape} Test={test_sc.shape}")
-        log.info(f"Regressor     : {type(reg).__name__}")
-        log.info(f"Classifier    : {type(clf).__name__}")
-        log.info(f"SC Regressor  : {type(reg_sc).__name__}")
-        log.info(f"SC Classifier : {type(clf_sc).__name__}")
-
-        return train, val, test, train_sc, val_sc, test_sc, reg, clf, reg_sc, clf_sc
+        log.info("All data and models loaded.")
+        return (train, val, test, sc_train, sc_val, sc_test,
+                feat_raw, feat_sc_raw,
+                reg, clf, reg_sc, clf_sc)
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# PLOT 1 — LEARNING CURVE
+# 1. SHAP — global bar + beeswarm
 # ─────────────────────────────────────────
 
-def plot_learning_curve(reg, X_train, y_train_reg, X_val, y_val_reg):
+def plot_shap(model, X, feature_cols, model_label, prefix, max_display=20):
     try:
-        log.info("Plotting learning curve...")
-        fractions   = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        n_train     = len(X_train)
-        train_maes  = []
-        val_maes    = []
-        sizes       = []
+        log.info(f"  Computing SHAP for {model_label}...")
 
-        for frac in fractions:
-            n     = max(10, int(n_train * frac))
-            X_sub = X_train[:n]
-            y_sub = y_train_reg[:n]
-            m     = pickle.loads(pickle.dumps(reg))
-            m.fit(X_sub, y_sub)
-            train_maes.append(mean_absolute_error(y_sub,      m.predict(X_sub)))
-            val_maes.append(  mean_absolute_error(y_val_reg,  m.predict(X_val)))
-            sizes.append(n)
+        # TreeExplainer works for LGB and XGB
+        explainer   = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
 
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(sizes, train_maes, "o-", color="#1E3A8A", label="Train MAE")
-        ax.plot(sizes, val_maes,   "o-", color="#15803D", label="Val MAE")
-        ax.fill_between(sizes, train_maes, val_maes, alpha=0.1, color="gray",
-                        label="Gap (overfit zone)")
-        ax.axhline(0.358, color="red", linestyle="--", linewidth=0.8,
-                   label="CV MAE (0.358s)")
-        ax.set_xlabel("Training Samples")
-        ax.set_ylabel("MAE (seconds)")
-        ax.set_title("Learning Curve — Regression (RandomForest)")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        save_fig(fig, "06_learning_curve.png")
+        # LGB classifier returns list [neg_class, pos_class] — take pos class
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]
 
+        # Global bar
+        fig, ax = plt.subplots(figsize=(8, 6))
+        mean_abs = np.abs(shap_values).mean(axis=0)
+        fi = pd.Series(mean_abs, index=feature_cols).sort_values(ascending=True)
+        fi = fi.tail(max_display)
+        colors = [VER_COLOR if v >= fi.median() else GREY for v in fi.values]
+        fi.plot(kind="barh", ax=ax, color=colors, edgecolor="none")
+        ax.set_title(f"SHAP Mean |value| — {model_label} | top {max_display}")
+        ax.set_xlabel("mean(|SHAP value|)")
+        ax.grid(True, axis="x")
+        ax.tick_params(axis="y", labelsize=8)
+        plt.tight_layout()
+        save_fig(f"{prefix}_shap_bar.png")
+
+        # Beeswarm (summary plot) — use shap's built-in
+        fig = plt.figure(figsize=(9, 7))
+        fig.patch.set_facecolor("#0f0f0f")
+        shap.summary_plot(
+            shap_values, X,
+            feature_names=feature_cols,
+            max_display=max_display,
+            show=False,
+            plot_type="dot",
+            color_bar=True,
+        )
+        ax = plt.gca()
+        ax.set_facecolor("#1a1a1a")
+        ax.tick_params(colors="#888888", labelsize=8)
+        ax.set_title(f"SHAP Beeswarm — {model_label}", color=NEUTRAL)
+        plt.tight_layout()
+        save_fig(f"{prefix}_shap_beeswarm.png")
+
+    except Exception as e:
+        log.warning(f"  SHAP failed for {model_label}: {e}")
+
+
+# ─────────────────────────────────────────
+# 2. CALIBRATION CURVE — classifier
+# ─────────────────────────────────────────
+
+def plot_calibration(clf, clf_sc,
+                     X_val, y_val, X_sc_val, y_sc_val,
+                     X_te, y_te, X_sc_te, y_sc_te):
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        fig.suptitle("Classifier Calibration Curves", color=NEUTRAL)
+
+        for ax, (model, X_v, y_v, X_t, y_t, label) in zip(axes, [
+            (clf,    X_val,    y_val,    X_te,    y_te,    "Full (LGB)"),
+            (clf_sc, X_sc_val, y_sc_val, X_sc_te, y_sc_te, "SC (XGB)"),
+        ]):
+            for X, y, split_label, color in [
+                (X_v, y_v, "Val",  HAM_COLOR),
+                (X_t, y_t, "TEST", VER_COLOR),
+            ]:
+                prob = model.predict_proba(X)[:, 1]
+                frac_pos, mean_pred = calibration_curve(y, prob, n_bins=8,
+                                                         strategy="quantile")
+                ax.plot(mean_pred, frac_pos, marker="o", linewidth=1.8,
+                        color=color, label=split_label)
+
+            ax.plot([0, 1], [0, 1], "--", color=GREY, linewidth=1,
+                    label="Perfect")
+            ax.set_title(f"{label}")
+            ax.set_xlabel("Mean predicted probability")
+            ax.set_ylabel("Fraction of positives (VER faster)")
+            ax.legend(fontsize=8)
+            ax.grid(True)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+
+        plt.tight_layout()
+        save_fig("calibration_curves.png")
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# PLOT 2 — RESIDUAL DIAGNOSTICS
+# 3. OVERFITTING PROFILE
+# Train / Val / Test MAE and AUC with CV band
 # ─────────────────────────────────────────
 
-def plot_residuals(reg, X_val, y_val_reg, val_df):
+def plot_overfitting_profile(metrics):
+    """
+    metrics: dict with keys full_reg, sc_reg, full_clf, sc_clf
+    Each value: dict with train, val, test, cv_mean, cv_std
+    """
     try:
-        log.info("Plotting residuals...")
-        pred      = reg.predict(X_val)
-        residuals = y_val_reg - pred
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        fig.suptitle("Overfitting Profile — Train / Val / Test", color=NEUTRAL)
 
-        
-
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        fig.suptitle("Regression Residual Diagnostics (Val Set)", fontsize=13)
-
-        # Actual vs Predicted
+        # Regression MAE
         ax = axes[0]
-        ax.scatter(y_val_reg, pred, color="#1E3A8A", alpha=0.7, s=40)
-        mn = min(y_val_reg.min(), pred.min()) - 0.2
-        mx = max(y_val_reg.max(), pred.max()) + 0.2
-        ax.plot([mn, mx], [mn, mx], "r--", linewidth=1, label="Perfect prediction")
-        ax.set_xlabel("Actual Delta (s)")
-        ax.set_ylabel("Predicted Delta (s)")
-        ax.set_title("Actual vs Predicted")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        splits = ["Train", "Val", "Test"]
+        for key, color, label in [
+            ("full_reg", VER_COLOR, "Full (LGB)"),
+            ("sc_reg",   HAM_COLOR, "SC (XGB)"),
+        ]:
+            vals = [metrics[key]["train"],
+                    metrics[key]["val"],
+                    metrics[key]["test"]]
+            ax.plot(splits, vals, marker="o", color=color,
+                    linewidth=2, label=label)
+            # CV band
+            cv_m = metrics[key]["cv_mean"]
+            cv_s = metrics[key]["cv_std"]
+            ax.axhspan(cv_m - cv_s, cv_m + cv_s,
+                       alpha=0.12, color=color,
+                       label=f"{label} CV ±1σ")
 
-        # Residuals vs Predicted — coloured by same_compound
-        # This directly tests whether large residuals cluster in compound-mismatch laps
+        ax.set_title("Regression MAE (s)")
+        ax.set_ylabel("MAE (s)")
+        ax.legend(fontsize=8)
+        ax.grid(True)
+
+        # Classification AUC
         ax = axes[1]
-        same_mask = val_df["same_compound"].values > 0.5
+        for key, color, label in [
+            ("full_clf", VER_COLOR, "Full (LGB)"),
+            ("sc_clf",   HAM_COLOR, "SC (XGB)"),
+        ]:
+            vals = [metrics[key]["train"],
+                    metrics[key]["val"],
+                    metrics[key]["test"]]
+            ax.plot(splits, vals, marker="o", color=color,
+                    linewidth=2, label=label)
+            cv_m = metrics[key]["cv_mean"]
+            cv_s = metrics[key]["cv_std"]
+            ax.axhspan(cv_m - cv_s, cv_m + cv_s,
+                       alpha=0.12, color=color,
+                       label=f"{label} CV ±1σ")
 
-        ax.scatter(pred[same_mask],  residuals[same_mask],
-                   color="#15803D", alpha=0.8, s=50, label="Same compound")
-        ax.scatter(pred[~same_mask], residuals[~same_mask],
-                   color="#DC2626", alpha=0.8, s=50, label="Diff compound",
-                   marker="^")
-        ax.axhline(0, color="red", linestyle="--", linewidth=1)
-        ax.set_xlabel("Predicted Delta (s)")
-        ax.set_ylabel("Residual (Actual - Predicted)")
-        ax.set_title("Residuals vs Predicted\n(coloured by compound match)")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.set_title("Classification AUC")
+        ax.set_ylabel("ROC-AUC")
+        ax.set_ylim(0.4, 1.05)
+        ax.legend(fontsize=8)
+        ax.grid(True)
 
-        # Residuals by Race
-        ax = axes[2]
-        colors_race = {"Bahrain": "#1E3A8A", "Spain": "#15803D", "AbuDhabi": "#B45309"}
-        for race in val_df["Race"].unique():
-            mask = val_df["Race"].values == race
-            ax.scatter(
-                val_df.loc[mask, "LapNumber"],
-                residuals[mask],
-                label=race,
-                color=colors_race.get(race, "gray"),
-                alpha=0.8, s=40
-            )
-        ax.axhline(0, color="red", linestyle="--", linewidth=1)
-        ax.set_xlabel("Lap Number (scaled)")
-        ax.set_ylabel("Residual (s)")
-        ax.set_title("Residuals by Race")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        save_fig(fig, "07_residual_diagnostics.png")
-
-        log.info(f"  Residual mean  = {residuals.mean():.4f}s  (bias)")
-        log.info(f"  Residual std   = {residuals.std():.4f}s")
-        log.info(f"  Max error      = {abs(residuals).max():.4f}s")
-
-        # Key finding: are large residuals in compound-mismatch laps?
-        if same_mask.sum() > 0 and (~same_mask).sum() > 0:
-            same_mae = mean_absolute_error(y_val_reg[same_mask],  pred[same_mask])
-            diff_mae  = mean_absolute_error(y_val_reg[~same_mask], pred[~same_mask])
-            log.info(f"\n  MAE by compound match:")
-            log.info(f"    Same compound laps : {same_mae:.4f}s")
-            log.info(f"    Diff compound laps : {diff_mae:.4f}s")
-            log.info(f"    Ratio (diff/same)  : {diff_mae/same_mae:.2f}x worse on diff compound")
-        else:
-            log.info(f"\n  MAE by compound match: skipped — one group has 0 samples in val set")
-        
+        plt.tight_layout()
+        save_fig("overfitting_profile.png")
     except Exception as e:
         raise CustomException(e, sys)
 
+
 # ─────────────────────────────────────────
-# PLOT 3 — CONFUSION MATRIX + ROC CURVE
+# 4. BIAS DECOMPOSITION — by upgrade era
+# Uses raw (unscaled) features for RoundNumber
 # ─────────────────────────────────────────
 
-def plot_classification_diagnostics(clf, X_val, y_val_clf):
+def plot_bias_by_era(feat_raw, reg, fc_train):
+    """
+    Upgrade eras:
+      Pre-VER upgrade  : rounds < 7
+      VER ahead        : rounds 7–9  (VER R7, HAM not until R13)
+      Parity           : rounds 10–12 (VER R10, HAM R13)
+      HAM upgrade      : rounds 13–17
+      HAM power token  : rounds 18–22 (HAM Brazil ICE)
+    """
     try:
-        log.info("Plotting classification diagnostics...")
-        pred      = clf.predict(X_val)
-        proba     = clf.predict_proba(X_val)[:, 1]
-        cm        = confusion_matrix(y_val_clf, pred)
-        fpr, tpr, _ = roc_curve(y_val_clf, proba)
-        roc_auc   = auc(fpr, tpr)
+        # Only training rounds (exclude val/test races)
+        from src.config import VAL_RACES, TEST_RACE, EXCLUDE_ROUNDS
+        train_raw = feat_raw[
+            ~feat_raw["Race"].isin(VAL_RACES + [TEST_RACE]) &
+            ~feat_raw["RoundNumber"].isin(EXCLUDE_ROUNDS)
+        ].copy()
+
+        # Build era labels
+        def era(rnd):
+            if rnd < 7:   return "Pre-upgrade\n(R1–6)"
+            if rnd < 10:  return "VER ahead\n(R7–9)"
+            if rnd < 13:  return "Near parity\n(R10–12)"
+            if rnd < 18:  return "HAM upgrade\n(R13–17)"
+            return "HAM power token\n(R18–21)"
+
+        train_raw["era"] = train_raw["RoundNumber"].apply(era)
+
+        # Predict on scaled train split (already in memory as X_tr from caller)
+        # Re-read scaled train to get predictions
+        train_scaled = pd.read_csv(TRAIN_PATH)
+        fc = get_feature_cols(train_scaled)
+        preds = reg.predict(train_scaled[fc].values)
+        actuals = train_scaled[TARGET_REGRESSION].values
+        residuals = preds - actuals
+
+        # Match order — train_raw and train_scaled should be same rows in same order
+        # Verify by checking shape
+        if len(train_raw) != len(train_scaled):
+            log.warning("  train_raw and train_scaled row count mismatch — "
+                        "skipping era bias plot")
+            return
+
+        train_raw = train_raw.reset_index(drop=True)
+        train_raw["residual"] = residuals
+        train_raw["actual"]   = actuals
+        train_raw["pred"]     = preds
+
+        era_order = ["Pre-upgrade\n(R1–6)", "VER ahead\n(R7–9)",
+                     "Near parity\n(R10–12)", "HAM upgrade\n(R13–17)",
+                     "HAM power token\n(R18–21)"]
+        era_order = [e for e in era_order if e in train_raw["era"].unique()]
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        fig.suptitle("Classification Diagnostics (Val Set)", fontsize=13)
+        fig.suptitle("Regression Bias by Upgrade Era (Train)", color=NEUTRAL)
 
-        # Confusion matrix
-        disp = ConfusionMatrixDisplay(cm, display_labels=["HAM Faster", "VER Faster"])
-        disp.plot(ax=axes[0], colorbar=False, cmap="Blues")
-        axes[0].set_title("Confusion Matrix")
-
-        # ROC curve
-        axes[1].plot(fpr, tpr, color="#1E3A8A", linewidth=2,
-                     label=f"ROC (AUC = {roc_auc:.3f})")
-        axes[1].plot([0, 1], [0, 1], "r--", linewidth=1, label="Random")
-        axes[1].set_xlabel("False Positive Rate")
-        axes[1].set_ylabel("True Positive Rate")
-        axes[1].set_title("ROC Curve")
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-
-        save_fig(fig, "08_classification_diagnostics.png")
-        log.info(f"  Val AUC = {roc_auc:.4f}")
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# PLOT 4 — SHAP FEATURE IMPORTANCE (Regression)
-# The portfolio showpiece — what drives lap time delta
-# ─────────────────────────────────────────
-
-def plot_shap_regression(reg, X_train, X_val):
-    try:
-        log.info("Computing SHAP values for regressor...")
-
-        explainer   = shap.TreeExplainer(reg)
-        shap_values = explainer.shap_values(X_val)
-
-        # ── 4a: SHAP summary bar (mean absolute impact) ──
-        fig, ax = plt.subplots(figsize=(9, 7))
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
-        sorted_idx    = np.argsort(mean_abs_shap)
-        colors        = ["#1E3A8A" if i >= len(sorted_idx) - 5
-                         else "#93C5FD" for i in range(len(sorted_idx))]
-
-        ax.barh(
-            [FEATURE_LABELS[i] for i in sorted_idx],
-            mean_abs_shap[sorted_idx],
-            color=colors
-        )
-        ax.set_xlabel("Mean |SHAP Value| (seconds impact on lap delta)")
-        ax.set_title("Feature Importance — What Drives Lap Time Delta\n"
-                     "(RandomForest Regressor, SHAP)")
-        ax.grid(True, alpha=0.3, axis="x")
-        save_fig(fig, "09a_shap_importance_reg.png")
-
-        # ── 4b: SHAP beeswarm (direction of impact) ──
-        fig, ax = plt.subplots(figsize=(10, 8))
-        shap.summary_plot(
-            shap_values, X_val,
-            feature_names=FEATURE_LABELS,
-            show=False, plot_type="dot"
-        )
-        plt.title("SHAP Beeswarm — Direction of Feature Impact on Lap Delta")
-        plt.tight_layout()
-        save_fig(plt.gcf(), "09b_shap_beeswarm_reg.png")
-
-        # Log top 5 features
-        top5_idx = np.argsort(mean_abs_shap)[::-1][:5]
-        log.info("  Top 5 features by SHAP impact (regression):")
-        for rank, i in enumerate(top5_idx, 1):
-            log.info(f"    {rank}. {FEATURE_LABELS[i]:<35} "
-                     f"mean |SHAP| = {mean_abs_shap[i]:.4f}s")
-
-        return shap_values
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# PLOT 5 — SHAP FEATURE IMPORTANCE (Classifier)
-# ─────────────────────────────────────────
-
-def plot_shap_classifier(clf, X_train, X_val):
-    try:
-        log.info("Computing SHAP values for classifier...")
-
-        # LogisticRegression — use LinearExplainer
-        explainer   = shap.LinearExplainer(clf, X_train,
-                                            feature_perturbation="interventional")
-        shap_values = explainer.shap_values(X_val)
-
-        fig, ax = plt.subplots(figsize=(9, 7))
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
-        sorted_idx    = np.argsort(mean_abs_shap)
-        colors        = ["#15803D" if i >= len(sorted_idx) - 5
-                         else "#86EFAC" for i in range(len(sorted_idx))]
-
-        ax.barh(
-            [FEATURE_LABELS[i] for i in sorted_idx],
-            mean_abs_shap[sorted_idx],
-            color=colors
-        )
-        ax.set_xlabel("Mean |SHAP Value| (impact on VER_faster probability)")
-        ax.set_title("Feature Importance — What Predicts VER Faster\n"
-                     "(LogisticRegression, SHAP)")
-        ax.grid(True, alpha=0.3, axis="x")
-        save_fig(fig, "10_shap_importance_clf.png")
-
-        log.info("  Top 5 features by SHAP impact (classifier):")
-        top5_idx = np.argsort(mean_abs_shap)[::-1][:5]
-        for rank, i in enumerate(top5_idx, 1):
-            log.info(f"    {rank}. {FEATURE_LABELS[i]:<35} "
-                     f"mean |SHAP| = {mean_abs_shap[i]:.4f}")
-
-        return shap_values
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-def plot_shap_regression_sc(reg_sc, X_train_sc, X_val_sc):
-    try:
-        log.info("Computing SHAP values for SC regressor (LinearRegression)...")
-
-        explainer   = shap.LinearExplainer(reg_sc, X_train_sc,
-                                            feature_perturbation="interventional")
-        shap_values = explainer.shap_values(X_val_sc)
-
-        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-        fig.suptitle("SHAP Feature Importance — Same-Compound Laps\n"
-                     "(Driving Style Isolated, LinearRegression)",
-                     fontsize=13)
-
-        # Bar chart
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
-        sorted_idx    = np.argsort(mean_abs_shap)
-        colors        = ["#B45309" if i >= len(sorted_idx) - 5
-                         else "#FCD34D" for i in range(len(sorted_idx))]
-
-        axes[0].barh(
-            [FEATURE_LABELS[i] for i in sorted_idx],
-            mean_abs_shap[sorted_idx],
-            color=colors
-        )
-        axes[0].set_xlabel("Mean |SHAP Value| (seconds impact on lap delta)")
-        axes[0].set_title("Feature Importance — SC Model")
-        axes[0].grid(True, alpha=0.3, axis="x")
-
-        # Side-by-side comparison with full model SHAP
-        # Compute full model SHAP for comparison
-        full_explainer   = shap.TreeExplainer(
-            pickle.loads(open(REGRESSOR_PATH, "rb").read())
-        )
-        full_shap_vals   = full_explainer.shap_values(X_val_sc)
-        full_mean_abs    = np.abs(full_shap_vals).mean(axis=0)
-
-        x      = np.arange(len(FEATURE_LABELS))
-        width  = 0.35
-        axes[1].barh(x - width/2, full_mean_abs,  width,
-                     label="Full Dataset (XGBoost)",    color="#1E3A8A", alpha=0.7)
-        axes[1].barh(x + width/2, mean_abs_shap,  width,
-                     label="Same Compound (LinearReg)", color="#B45309", alpha=0.7)
-        axes[1].set_yticks(x)
-        axes[1].set_yticklabels(FEATURE_LABELS, fontsize=8)
-        axes[1].set_xlabel("Mean |SHAP Value|")
-        axes[1].set_title("Full vs SC — Feature Importance Shift")
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3, axis="x")
-
-        plt.tight_layout()
-        save_fig(fig, "13_shap_comparison_full_vs_sc.png")
-
-        log.info("  Top 5 SC features by SHAP impact:")
-        top5 = np.argsort(mean_abs_shap)[::-1][:5]
-        for rank, i in enumerate(top5, 1):
-            log.info(f"    {rank}. {FEATURE_LABELS[i]:<35} "
-                     f"mean |SHAP| = {mean_abs_shap[i]:.4f}s")
-
-        return shap_values
-
-    except Exception as e:
-        raise CustomException(e, sys)
-    
-
-
-
-# ─────────────────────────────────────────
-# PLOT 6 — DRIVER STYLE FINGERPRINT
-# The fan-facing insight plot
-# Average driving style metrics per driver per race
-# ─────────────────────────────────────────
-
-def plot_driver_fingerprint(train_df, val_df, test_df):
-    try:
-        log.info("Plotting driver style fingerprints...")
-
-        # Combine all splits — use unscaled features.csv for this
-        # We read from features.csv which has raw (unscaled) values
-        from src.config import FEATURES_PATH
-        features_df = pd.read_csv(FEATURES_PATH)
-
-        style_metrics = {
-            "Coasting %"        : ("VER_coasting_pct",         "HAM_coasting_pct"),
-            "Full Throttle %"   : ("VER_full_throttle_pct",    "HAM_full_throttle_pct"),
-            "Gear Shifts/Lap"   : ("VER_gear_shifts",          "HAM_gear_shifts"),
-            "Brake Zone (m)"    : ("VER_avg_brake_zone_length","HAM_avg_brake_zone_length"),
-            "Entry Speed (km/h)": ("VER_avg_entry_speed",      "HAM_avg_entry_speed"),
-        }
-
-        races = ["Bahrain", "Spain", "AbuDhabi"]
-        fig, axes = plt.subplots(len(style_metrics), len(races),
-                                 figsize=(15, 14), sharey="row")
-        fig.suptitle("Driver Style Fingerprint — VER vs HAM per Race\n"
-                     "(Average per lap, all clean green-flag laps)",
-                     fontsize=13, y=1.01)
-
-        colors = {"VER": "#1E3A8A", "HAM": "#15803D"}
-
-        for row_idx, (metric_name, (ver_col, ham_col)) in enumerate(style_metrics.items()):
-            for col_idx, race in enumerate(races):
-                ax    = axes[row_idx][col_idx]
-                rdata = features_df[features_df["Race"] == race]
-
-                ver_vals = rdata[ver_col]
-                ham_vals = rdata[ham_col]
-
-                ax.hist(ver_vals, bins=15, alpha=0.6,
-                        color=colors["VER"], label="VER")
-                ax.hist(ham_vals, bins=15, alpha=0.6,
-                        color=colors["HAM"], label="HAM")
-
-                ax.axvline(ver_vals.mean(), color=colors["VER"],
-                           linestyle="--", linewidth=1.5,
-                           label=f"VER mean={ver_vals.mean():.2f}")
-                ax.axvline(ham_vals.mean(), color=colors["HAM"],
-                           linestyle="--", linewidth=1.5,
-                           label=f"HAM mean={ham_vals.mean():.2f}")
-
-                if row_idx == 0:
-                    ax.set_title(race, fontsize=11)
-                if col_idx == 0:
-                    ax.set_ylabel(metric_name, fontsize=9)
-                if row_idx == 0 and col_idx == 0:
-                    ax.legend(fontsize=7)
-
-                ax.grid(True, alpha=0.2)
-
-        plt.tight_layout()
-        save_fig(fig, "11_driver_fingerprint.png")
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# TEST SET EVALUATION — the untouched holdout
-# ─────────────────────────────────────────
-
-def evaluate_test_set(reg, clf, X_test, y_test_reg, y_test_clf, test_df):
-    try:
-        log.info("=" * 60)
-        log.info("TEST SET EVALUATION — Final holdout")
-        log.info("=" * 60)
-
-        # Regression
-        reg_pred  = reg.predict(X_test)
-        test_mae  = mean_absolute_error(y_test_reg, reg_pred)
-        test_rmse = mean_squared_error(y_test_reg,  reg_pred) ** 0.5
-        test_r2   = r2_score(y_test_reg, reg_pred)
-
-        log.info(f"\n  REGRESSION on test set:")
-        log.info(f"    MAE  = {test_mae:.4f}s")
-        log.info(f"    RMSE = {test_rmse:.4f}s")
-        log.info(f"    R2   = {test_r2:.4f}")
-
-        # Classification
-        clf_pred  = clf.predict(X_test)
-        clf_proba = clf.predict_proba(X_test)[:, 1]
-        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-        test_acc  = accuracy_score(y_test_clf, clf_pred)
-        test_f1   = f1_score(y_test_clf, clf_pred, zero_division=0)
-        test_auc  = roc_auc_score(y_test_clf, clf_proba)
-
-        log.info(f"\n  CLASSIFICATION on test set:")
-        log.info(f"    Accuracy = {test_acc:.4f}")
-        log.info(f"    F1       = {test_f1:.4f}")
-        log.info(f"    AUC      = {test_auc:.4f}")
-
-        # Compare val vs test
-        log.info(f"\n  Val vs Test comparison:")
-        log.info(f"    Regression  MAE  — Val: 0.2515s | Test: {test_mae:.4f}s")
-        log.info(f"    Classifier  AUC  — Val: 1.0000  | Test: {test_auc:.4f}")
-
-        # Final verdict
-        log.info(f"\n  FINAL VERDICT:")
-        if abs(test_mae - 0.2515) < 0.10:
-            log.info("    Regression generalizes well to test set. ✓")
-        else:
-            log.info("    Regression test MAE diverges from val — "
-                     "consider more data or additional features.")
-
-        if test_auc >= 0.80:
-            log.info("    Classifier generalizes well to test set. ✓")
-        else:
-            log.info("    Classifier AUC dropped on test — "
-                     "model is sensitive to lap composition. "
-                     "Consider stratifying by same_compound.")
-
-        # Test set prediction plot
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-        fig.suptitle("Test Set Evaluation", fontsize=13)
-
-        # Actual vs predicted (regression)
+        # Mean residual per era
         ax = axes[0]
-        colors_race = {"Bahrain": "#1E3A8A", "Spain": "#15803D", "AbuDhabi": "#B45309"}
-        for race in test_df["Race"].unique():
-            mask = test_df["Race"].values == race
-            ax.scatter(y_test_reg[mask], reg_pred[mask],
-                       label=race, color=colors_race.get(race, "gray"),
-                       alpha=0.8, s=50)
-        mn = min(y_test_reg.min(), reg_pred.min()) - 0.2
-        mx = max(y_test_reg.max(), reg_pred.max()) + 0.2
-        ax.plot([mn, mx], [mn, mx], "r--", linewidth=1, label="Perfect")
-        ax.set_xlabel("Actual Delta (s)")
-        ax.set_ylabel("Predicted Delta (s)")
-        ax.set_title(f"Regression — Test MAE={test_mae:.3f}s  R2={test_r2:.3f}")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        era_bias = train_raw.groupby("era")["residual"].mean().reindex(era_order)
+        colors = [VER_COLOR if v >= 0 else HAM_COLOR for v in era_bias.values]
+        era_bias.plot(kind="bar", ax=ax, color=colors, edgecolor="none")
+        ax.axhline(0, color=ACCENT, linewidth=1.2, linestyle="--")
+        ax.set_title("Mean Residual (pred − actual) by Era")
+        ax.set_ylabel("Mean residual (s)")
+        ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=0)
+        ax.grid(True, axis="y")
 
-        # Predicted probability distribution (classifier)
+        # Boxplot residuals per era
         ax = axes[1]
-        ax.hist(clf_proba[y_test_clf == 0], bins=10, alpha=0.6,
-                color="#15803D", label="HAM Faster (actual)")
-        ax.hist(clf_proba[y_test_clf == 1], bins=10, alpha=0.6,
-                color="#1E3A8A", label="VER Faster (actual)")
-        ax.axvline(0.5, color="red", linestyle="--", label="Decision boundary")
-        ax.set_xlabel("Predicted Probability (VER Faster)")
-        ax.set_ylabel("Count")
-        ax.set_title(f"Classifier — Test AUC={test_auc:.3f}  F1={test_f1:.3f}")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        era_groups = [train_raw[train_raw["era"] == e]["residual"].values
+                      for e in era_order]
+        bp = ax.boxplot(era_groups, patch_artist=True,
+                        medianprops=dict(color=ACCENT, linewidth=1.5),
+                        flierprops=dict(marker="o", markersize=3,
+                                        markerfacecolor=GREY))
+        for patch in bp["boxes"]:
+            patch.set_facecolor(VER_COLOR)
+            patch.set_alpha(0.6)
+        ax.axhline(0, color=ACCENT, linewidth=1.2, linestyle="--")
+        ax.set_xticklabels(era_order, fontsize=7)
+        ax.set_title("Residual Distribution by Era")
+        ax.set_ylabel("Residual (pred − actual, s)")
+        ax.grid(True, axis="y")
 
-        save_fig(fig, "12_test_set_evaluation.png")
-
-        return {
-            "test_mae" : test_mae,
-            "test_rmse": test_rmse,
-            "test_r2"  : test_r2,
-            "test_acc" : test_acc,
-            "test_f1"  : test_f1,
-            "test_auc" : test_auc,
-        }
-
+        plt.tight_layout()
+        save_fig("bias_by_era.png")
     except Exception as e:
         raise CustomException(e, sys)
 
-def evaluate_test_set_sc(reg_sc, clf_sc, X_test_sc,
-                          y_test_sc_reg, y_test_sc_clf, test_sc_df):
+
+# ─────────────────────────────────────────
+# 5. PER-RACE CLASSIFIER ACCURACY
+# ─────────────────────────────────────────
+
+def plot_per_race_accuracy(feat_raw, clf, train, val, test):
     try:
-        log.info("=" * 60)
-        log.info("SC TEST SET EVALUATION — Same-compound holdout")
-        log.info("=" * 60)
+        all_splits = pd.concat([train, val, test], ignore_index=True)
+        fc = get_feature_cols(train)
 
-        from sklearn.metrics import (mean_absolute_error, mean_squared_error,
-                                     r2_score, accuracy_score,
-                                     f1_score, roc_auc_score)
+        all_splits["pred_prob"] = clf.predict_proba(all_splits[fc].values)[:, 1]
+        all_splits["pred"]      = clf.predict(all_splits[fc].values)
+        all_splits["correct"]   = (all_splits["pred"] ==
+                                   all_splits[TARGET_CLASSIFICATION]).astype(int)
 
-        reg_pred  = reg_sc.predict(X_test_sc)
-        test_mae  = mean_absolute_error(y_test_sc_reg, reg_pred)
-        test_rmse = mean_squared_error(y_test_sc_reg,  reg_pred) ** 0.5
-        test_r2   = r2_score(y_test_sc_reg, reg_pred)
+        # Merge race labels from raw features
+        race_map = feat_raw[["Race", "RoundNumber"]].drop_duplicates()
+        all_splits = all_splits.merge(race_map, on=["Race", "RoundNumber"],
+                                      how="left")
 
-        clf_pred  = clf_sc.predict(X_test_sc)
-        clf_proba = clf_sc.predict_proba(X_test_sc)[:, 1]
-        test_acc  = accuracy_score(y_test_sc_clf, clf_pred)
-        test_f1   = f1_score(y_test_sc_clf, clf_pred, zero_division=0)
-        test_auc  = roc_auc_score(y_test_sc_clf, clf_proba)
+        race_acc = (all_splits.groupby("Race")["correct"]
+                    .mean()
+                    .sort_values(ascending=True))
 
-        log.info(f"\n  SC REGRESSION on test:")
-        log.info(f"    MAE  = {test_mae:.4f}s")
-        log.info(f"    RMSE = {test_rmse:.4f}s")
-        log.info(f"    R2   = {test_r2:.4f}")
-        log.info(f"\n  SC CLASSIFICATION on test:")
-        log.info(f"    Accuracy = {test_acc:.4f}")
-        log.info(f"    F1       = {test_f1:.4f}")
-        log.info(f"    AUC      = {test_auc:.4f}")
+        # Tag split
+        val_races  = val["Race"].unique().tolist()
+        test_races = test["Race"].unique().tolist()
 
-        # Comparison table
-        log.info(f"\n  Full vs SC — Test Set Comparison:")
-        log.info(f"    {'Metric':<20} {'Full Dataset':>15} {'Same Compound':>15}")
-        log.info(f"    {'-'*50}")
-        log.info(f"    {'Reg MAE':<20} {'0.6679s':>15} {test_mae:>14.4f}s")
-        log.info(f"    {'Reg R2':<20} {'0.4283':>15} {test_r2:>15.4f}")
-        log.info(f"    {'Clf AUC':<20} {'0.8571':>15} {test_auc:>15.4f}")
-        log.info(f"    {'Clf F1':<20} {'0.8000':>15} {test_f1:>15.4f}")
+        def split_tag(race):
+            if race in test_races: return "TEST"
+            if race in val_races:  return "Val"
+            return "Train"
 
-        # Plot
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-        fig.suptitle("SC Test Set Evaluation — Same-Compound Laps Only", fontsize=13)
+        colors = []
+        for race in race_acc.index:
+            tag = split_tag(race)
+            if tag == "TEST":   colors.append(ACCENT)
+            elif tag == "Val":  colors.append(HAM_COLOR)
+            else:               colors.append(VER_COLOR)
 
-        colors_race = {"Bahrain": "#1E3A8A", "Spain": "#15803D", "AbuDhabi": "#B45309"}
-        for race in test_sc_df["Race"].unique():
-            mask = test_sc_df["Race"].values == race
-            axes[0].scatter(y_test_sc_reg[mask], reg_pred[mask],
-                            label=race, color=colors_race.get(race, "gray"),
-                            alpha=0.8, s=60)
-        mn = min(y_test_sc_reg.min(), reg_pred.min()) - 0.2
-        mx = max(y_test_sc_reg.max(), reg_pred.max()) + 0.2
-        axes[0].plot([mn, mx], [mn, mx], "r--", linewidth=1, label="Perfect")
-        axes[0].set_xlabel("Actual Delta (s)")
-        axes[0].set_ylabel("Predicted Delta (s)")
-        axes[0].set_title(f"SC Regression — MAE={test_mae:.3f}s  R2={test_r2:.3f}")
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=(12, 5))
+        bars = ax.barh(race_acc.index, race_acc.values,
+                       color=colors, edgecolor="none")
+        ax.axvline(0.5, color=GREY, linewidth=1, linestyle="--")
+        ax.axvline(race_acc.mean(), color=NEUTRAL, linewidth=1,
+                   linestyle=":", label=f"Mean={race_acc.mean():.2f}")
 
-        axes[1].hist(clf_proba[y_test_sc_clf == 0], bins=8, alpha=0.6,
-                     color="#15803D", label="HAM Faster (actual)")
-        axes[1].hist(clf_proba[y_test_sc_clf == 1], bins=8, alpha=0.6,
-                     color="#1E3A8A", label="VER Faster (actual)")
-        axes[1].axvline(0.5, color="red", linestyle="--", label="Decision boundary")
-        axes[1].set_xlabel("Predicted Probability (VER Faster)")
-        axes[1].set_ylabel("Count")
-        axes[1].set_title(f"SC Classifier — AUC={test_auc:.3f}  F1={test_f1:.3f}")
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
+        legend_patches = [
+            mpatches.Patch(color=VER_COLOR, label="Train"),
+            mpatches.Patch(color=HAM_COLOR, label="Val"),
+            mpatches.Patch(color=ACCENT,    label="TEST"),
+        ]
+        ax.legend(handles=legend_patches, fontsize=8)
+        ax.set_title("Per-Race Classifier Accuracy — Full LGB Model")
+        ax.set_xlabel("Accuracy")
+        ax.set_xlim(0, 1)
+        ax.grid(True, axis="x")
 
-        save_fig(fig, "14_sc_test_set_evaluation.png")
-
-        return {
-            "sc_test_mae" : test_mae,
-            "sc_test_rmse": test_rmse,
-            "sc_test_r2"  : test_r2,
-            "sc_test_acc" : test_acc,
-            "sc_test_f1"  : test_f1,
-            "sc_test_auc" : test_auc,
-        }
-
+        plt.tight_layout()
+        save_fig("per_race_accuracy.png")
     except Exception as e:
         raise CustomException(e, sys)
-    
+
+
+# ─────────────────────────────────────────
+# 6. FEATURE CORRELATION HEATMAP
+# Top 20 features — multicollinearity check
+# ─────────────────────────────────────────
+
+def plot_feature_correlation(train, top_n=20):
+    try:
+        fc = get_feature_cols(train)
+
+        # Select top_n by variance
+        variances = train[fc].var().sort_values(ascending=False)
+        top_cols  = variances.head(top_n).index.tolist()
+
+        corr = train[top_cols].corr()
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+        mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+        sns.heatmap(corr, mask=mask, ax=ax, cmap="coolwarm",
+                    center=0, vmin=-1, vmax=1,
+                    annot=True, fmt=".1f", annot_kws={"size": 6},
+                    linewidths=0.3, square=True,
+                    cbar_kws={"shrink": 0.7})
+        ax.set_title(f"Feature Correlation (top {top_n} by variance) — Train")
+        ax.tick_params(axis="x", rotation=45, labelsize=7)
+        ax.tick_params(axis="y", labelsize=7)
+
+        plt.tight_layout()
+        save_fig("feature_correlation.png")
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# 7. ROLLING CLASSIFIER CONFIDENCE — Abu Dhabi
+# Shows how model confidence evolves lap by lap
+# ─────────────────────────────────────────
+
+def plot_rolling_confidence(test, clf, feat_raw):
+    try:
+        fc = get_feature_cols(test)
+        probs   = clf.predict_proba(test[fc].values)[:, 1]
+        actuals = test[TARGET_CLASSIFICATION].values
+
+        test_raw = feat_raw[feat_raw["Race"] == "AbuDhabi"].copy()
+        test_raw = test_raw.sort_values("LapNumber").reset_index(drop=True)
+
+        if len(test_raw) != len(test):
+            log.warning("  Abu Dhabi raw/scaled length mismatch — "
+                        "using sequential index for confidence plot")
+            laps = np.arange(1, len(test) + 1)
+        else:
+            laps = np.arange(1, len(test_raw) + 1)
+
+        # Sort test by same order as raw
+        test_sorted = test.copy().reset_index(drop=True)
+        probs_sorted   = probs
+        actuals_sorted = actuals
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+        fig.suptitle("Abu Dhabi 2021 — Classifier Confidence & Correctness",
+                     color=NEUTRAL)
+
+        # Probability trace
+        ax1.axhline(0.5, color=GREY, linewidth=0.8, linestyle="--")
+        ax1.fill_between(laps, 0.5, probs_sorted,
+                         where=probs_sorted >= 0.5,
+                         alpha=0.3, color=VER_COLOR, label="P(VER faster)")
+        ax1.fill_between(laps, probs_sorted, 0.5,
+                         where=probs_sorted < 0.5,
+                         alpha=0.3, color=HAM_COLOR, label="P(HAM faster)")
+        ax1.plot(laps, probs_sorted, color=NEUTRAL, linewidth=1.2)
+        ax1.set_ylabel("P(VER faster)")
+        ax1.set_ylim(0, 1)
+        ax1.legend(fontsize=8)
+        ax1.grid(True)
+
+        # Correct / incorrect markers
+        correct   = actuals_sorted == (probs_sorted >= 0.5).astype(int)
+        ax2.scatter(laps[correct],  np.ones(correct.sum()),
+                    color=GREEN, s=40, zorder=3, label="Correct")
+        ax2.scatter(laps[~correct], np.ones((~correct).sum()),
+                    color=ACCENT, s=40, marker="x", zorder=3, label="Wrong")
+        ax2.set_yticks([])
+        ax2.set_xlabel("Lap (race order)")
+        ax2.set_title(f"Accuracy={correct.mean():.2%}  "
+                      f"AUC={roc_auc_score(actuals_sorted, probs_sorted):.3f}")
+        ax2.legend(fontsize=8)
+        ax2.grid(True, axis="x")
+
+        plt.tight_layout()
+        save_fig("rolling_confidence_abu_dhabi.png")
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# 8. SEASON NARRATIVE — championship arc
+# Per-race median actual delta + model prediction
+# Upgrade markers overlaid
+# ─────────────────────────────────────────
+
+def plot_season_narrative(feat_raw, reg, train, val, test):
+    try:
+        all_splits  = pd.concat([train, val, test], ignore_index=True)
+        fc          = get_feature_cols(train)
+        all_preds   = reg.predict(all_splits[fc].values)
+        all_splits["pred"] = all_preds
+
+        # Merge round numbers from raw
+        race_rnd = feat_raw[["Race", "RoundNumber"]].drop_duplicates()
+        all_splits = all_splits.merge(race_rnd, on=["Race", "RoundNumber"],
+                                      how="left")
+
+        race_summary = (all_splits
+                        .groupby(["Race", "RoundNumber"])
+                        .agg(actual_median=(TARGET_REGRESSION, "median"),
+                             pred_median=("pred", "median"),
+                             n=("pred", "count"))
+                        .reset_index()
+                        .sort_values("RoundNumber"))
+
+        x     = np.arange(len(race_summary))
+        races = race_summary["Race"].values
+        rnd   = race_summary["RoundNumber"].values
+
+        fig, ax = plt.subplots(figsize=(16, 6))
+
+        ax.fill_between(x, 0, race_summary["actual_median"].values,
+                        where=race_summary["actual_median"].values < 0,
+                        alpha=0.2, color=VER_COLOR)
+        ax.fill_between(x, 0, race_summary["actual_median"].values,
+                        where=race_summary["actual_median"].values >= 0,
+                        alpha=0.2, color=HAM_COLOR)
+
+        ax.plot(x, race_summary["actual_median"].values,
+                color=NEUTRAL, linewidth=2, marker="o", markersize=5,
+                label="Actual median Δ")
+        ax.plot(x, race_summary["pred_median"].values,
+                color=ACCENT, linewidth=1.5, linestyle="--",
+                marker="s", markersize=4, label="Predicted median Δ")
+
+        ax.axhline(0, color=GREY, linewidth=0.8, linestyle=":")
+
+        # Upgrade markers
+        for r in VER_UPGRADE_ROUNDS:
+            idx = np.where(rnd == r)[0]
+            if len(idx):
+                ax.axvline(idx[0], color=VER_COLOR, linewidth=1.2,
+                           linestyle=":", alpha=0.7)
+                ax.text(idx[0] + 0.1, ax.get_ylim()[1] * 0.85,
+                        f"RB R{r}", color=VER_COLOR, fontsize=7, rotation=90)
+
+        for r in HAM_UPGRADE_ROUNDS:
+            idx = np.where(rnd == r)[0]
+            if len(idx):
+                ax.axvline(idx[0], color=HAM_COLOR, linewidth=1.2,
+                           linestyle=":", alpha=0.7)
+                ax.text(idx[0] + 0.1, ax.get_ylim()[1] * 0.6,
+                        f"Merc R{r}", color=HAM_COLOR, fontsize=7, rotation=90)
+
+        # Split shading — val and test bands
+        val_races  = val["Race"].unique().tolist()
+        test_races = test["Race"].unique().tolist()
+        for i, race in enumerate(races):
+            if race in test_races:
+                ax.axvspan(i - 0.5, i + 0.5, alpha=0.12, color=ACCENT)
+            elif race in val_races:
+                ax.axvspan(i - 0.5, i + 0.5, alpha=0.08, color=HAM_COLOR)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(races, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("Median Δ lap time (s)\n(VER − HAM, negative = VER faster)")
+        ax.set_title("2021 Season — Actual vs Predicted Median Lap Time Delta")
+
+        legend_patches = [
+            mpatches.Patch(color=HAM_COLOR, alpha=0.3, label="Val races"),
+            mpatches.Patch(color=ACCENT,    alpha=0.3, label="Test race (Abu Dhabi)"),
+        ]
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles + legend_patches, labels + ["Val races", "Test race"],
+                  fontsize=8, loc="upper right")
+        ax.grid(True, axis="y")
+
+        plt.tight_layout()
+        save_fig("season_narrative.png")
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# 9. PARTIAL DEPENDENCE — top 3 features
+# ─────────────────────────────────────────
+
+def plot_partial_dependence(model, X_train, feature_cols, model_label,
+                             prefix, top_features=None):
+    try:
+        if top_features is None:
+            # Use top 3 by feature importance
+            imp = model.feature_importances_
+            top_idx    = np.argsort(imp)[::-1][:3]
+            top_features = [feature_cols[i] for i in top_idx]
+
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        fig.suptitle(f"Partial Dependence — {model_label}", color=NEUTRAL)
+
+        for ax, feat in zip(axes, top_features):
+            feat_idx = feature_cols.index(feat)
+            grid = np.linspace(X_train[:, feat_idx].min(),
+                               X_train[:, feat_idx].max(), 60)
+
+            X_tmp = X_train.copy()
+            pdp_vals = []
+            for val in grid:
+                X_tmp[:, feat_idx] = val
+                if hasattr(model, "predict_proba"):
+                    pdp_vals.append(model.predict_proba(X_tmp)[:, 1].mean())
+                else:
+                    pdp_vals.append(model.predict(X_tmp).mean())
+
+            ax.plot(grid, pdp_vals, color=VER_COLOR, linewidth=2)
+            ax.axhline(np.mean(pdp_vals), color=GREY, linewidth=0.8,
+                       linestyle="--")
+            ax.set_title(feat, fontsize=9)
+            ax.set_xlabel("Feature value (scaled)")
+            ax.set_ylabel("Predicted output (mean)")
+            ax.grid(True)
+
+        plt.tight_layout()
+        save_fig(f"{prefix}_pdp.png")
+    except Exception as e:
+        log.warning(f"  PDP failed for {model_label}: {e}")
+
 
 # ─────────────────────────────────────────
 # MAIN
@@ -683,80 +684,113 @@ def evaluate_test_set_sc(reg_sc, clf_sc, X_test_sc,
 def run_diagnostics():
     try:
         log.info("=" * 60)
-        log.info("Starting model diagnostics")
+        log.info("Starting model diagnostics — Phase 2")
         log.info("=" * 60)
 
         (train, val, test,
-         train_sc, val_sc, test_sc,
+         sc_train, sc_val, sc_test,
+         feat_raw, feat_sc_raw,
          reg, clf, reg_sc, clf_sc) = load_all()
 
-        X_train = train[FEATURE_COLS].values
-        X_val   = val[FEATURE_COLS].values
-        X_test  = test[FEATURE_COLS].values
+        fc      = get_feature_cols(train)
+        fc_sc   = get_feature_cols(sc_train)
 
-        X_train_sc = train_sc[FEATURE_COLS].values
-        X_val_sc   = val_sc[FEATURE_COLS].values
-        X_test_sc  = test_sc[FEATURE_COLS].values
+        X_tr  = train[fc].values;      y_tr_r = train[TARGET_REGRESSION].values
+        X_val = val[fc].values;        y_val_r = val[TARGET_REGRESSION].values
+        X_te  = test[fc].values;       y_te_r  = test[TARGET_REGRESSION].values
+        y_tr_c  = train[TARGET_CLASSIFICATION].values
+        y_val_c = val[TARGET_CLASSIFICATION].values
+        y_te_c  = test[TARGET_CLASSIFICATION].values
 
-        y_train_reg    = train[TARGET_REGRESSION].values
-        y_val_reg      = val[TARGET_REGRESSION].values
-        y_test_reg     = test[TARGET_REGRESSION].values
-        y_train_clf    = train[TARGET_CLASSIFICATION].values
-        y_val_clf      = val[TARGET_CLASSIFICATION].values
-        y_test_clf     = test[TARGET_CLASSIFICATION].values
+        X_sc_tr  = sc_train[fc_sc].values; y_sc_tr_r  = sc_train[TARGET_REGRESSION].values
+        X_sc_val = sc_val[fc_sc].values;   y_sc_val_r = sc_val[TARGET_REGRESSION].values
+        X_sc_te  = sc_test[fc_sc].values;  y_sc_te_r  = sc_test[TARGET_REGRESSION].values
+        y_sc_tr_c  = sc_train[TARGET_CLASSIFICATION].values
+        y_sc_val_c = sc_val[TARGET_CLASSIFICATION].values
+        y_sc_te_c  = sc_test[TARGET_CLASSIFICATION].values
 
-        y_test_sc_reg  = test_sc[TARGET_REGRESSION].values
-        y_test_sc_clf  = test_sc[TARGET_CLASSIFICATION].values
+        # ── 1. SHAP ───────────────────────────────────────────
+        log.info("\n[1/9] SHAP values")
+        # Use train sample for speed (max 200 rows for beeswarm)
+        shap_n = min(200, len(X_tr))
+        idx    = np.random.choice(len(X_tr), shap_n, replace=False)
+        plot_shap(reg,    X_tr[idx],    fc,    "LGB Regressor (Full)",  "reg_full")
+        plot_shap(clf,    X_tr[idx],    fc,    "LGB Classifier (Full)", "clf_full")
+        plot_shap(reg_sc, X_sc_tr[:shap_n], fc_sc, "XGB Regressor (SC)",  "reg_sc")
+        plot_shap(clf_sc, X_sc_tr[:shap_n], fc_sc, "XGB Classifier (SC)", "clf_sc")
 
-        # ── Full model diagnostics ──
-        log.info("\n>>> FULL MODEL DIAGNOSTICS")
-        plot_learning_curve(reg, X_train, y_train_reg, X_val, y_val_reg)
-        plot_residuals(reg, X_val, y_val_reg, val)
-        plot_classification_diagnostics(clf, X_val, y_val_clf)
-        plot_shap_regression(reg, X_train, X_val)
-        plot_shap_classifier(clf, X_train, X_val)
-        plot_driver_fingerprint(train, val, test)
-        full_results = evaluate_test_set(
-            reg, clf, X_test, y_test_reg, y_test_clf, test
-        )
+        # ── 2. CALIBRATION ───────────────────────────────────
+        log.info("\n[2/9] Calibration curves")
+        plot_calibration(clf, clf_sc,
+                         X_val, y_val_c, X_sc_val, y_sc_val_c,
+                         X_te,  y_te_c,  X_sc_te,  y_sc_te_c)
 
-        # ── SC model diagnostics ──
-        log.info("\n>>> SAME-COMPOUND MODEL DIAGNOSTICS")
-        plot_shap_regression_sc(reg_sc, X_train_sc, X_val_sc)
-        sc_results = evaluate_test_set_sc(
-            reg_sc, clf_sc, X_test_sc,
-            y_test_sc_reg, y_test_sc_clf, test_sc
-        )
+        # ── 3. OVERFITTING PROFILE ───────────────────────────
+        log.info("\n[3/9] Overfitting profile")
+        # CV stats sourced from trainer logs (hardcoded from last run)
+        metrics = {
+            "full_reg": {
+                "train": mean_absolute_error(y_tr_r,     reg.predict(X_tr)),
+                "val"  : mean_absolute_error(y_val_r,    reg.predict(X_val)),
+                "test" : mean_absolute_error(y_te_r,     reg.predict(X_te)),
+                "cv_mean": 0.4713, "cv_std": 0.0,   # LGB full CV MAE
+            },
+            "sc_reg": {
+                "train": mean_absolute_error(y_sc_tr_r,  reg_sc.predict(X_sc_tr)),
+                "val"  : mean_absolute_error(y_sc_val_r, reg_sc.predict(X_sc_val)),
+                "test" : mean_absolute_error(y_sc_te_r,  reg_sc.predict(X_sc_te)),
+                "cv_mean": 0.3859, "cv_std": 0.0,   # XGB SC CV MAE
+            },
+            "full_clf": {
+                "train": roc_auc_score(y_tr_c,    clf.predict_proba(X_tr)[:,1]),
+                "val"  : roc_auc_score(y_val_c,   clf.predict_proba(X_val)[:,1]),
+                "test" : roc_auc_score(y_te_c,    clf.predict_proba(X_te)[:,1]),
+                "cv_mean": 0.7403, "cv_std": 0.0,  # LGB full CV AUC
+            },
+            "sc_clf": {
+                "train": roc_auc_score(y_sc_tr_c,  clf_sc.predict_proba(X_sc_tr)[:,1]),
+                "val"  : roc_auc_score(y_sc_val_c, clf_sc.predict_proba(X_sc_val)[:,1]),
+                "test" : roc_auc_score(y_sc_te_c,  clf_sc.predict_proba(X_sc_te)[:,1]),
+                "cv_mean": 0.7398, "cv_std": 0.0,  # XGB SC CV AUC
+            },
+        }
+        plot_overfitting_profile(metrics)
 
+        # ── 4. BIAS BY ERA ───────────────────────────────────
+        log.info("\n[4/9] Bias by upgrade era")
+        plot_bias_by_era(feat_raw, reg, fc)
+
+        # ── 5. PER-RACE ACCURACY ─────────────────────────────
+        log.info("\n[5/9] Per-race classifier accuracy")
+        plot_per_race_accuracy(feat_raw, clf, train, val, test)
+
+        # ── 6. FEATURE CORRELATION ───────────────────────────
+        log.info("\n[6/9] Feature correlation heatmap")
+        plot_feature_correlation(train)
+
+        # ── 7. ROLLING CONFIDENCE ────────────────────────────
+        log.info("\n[7/9] Rolling classifier confidence — Abu Dhabi")
+        plot_rolling_confidence(test, clf, feat_raw)
+
+        # ── 8. SEASON NARRATIVE ──────────────────────────────
+        log.info("\n[8/9] Season narrative plot")
+        plot_season_narrative(feat_raw, reg, train, val, test)
+
+        # ── 9. PARTIAL DEPENDENCE ────────────────────────────
+        log.info("\n[9/9] Partial dependence plots")
+        plot_partial_dependence(reg,    X_tr,    fc,    "LGB Regressor (Full)", "reg_full")
+        plot_partial_dependence(clf,    X_tr,    fc,    "LGB Classifier (Full)","clf_full")
+        plot_partial_dependence(reg_sc, X_sc_tr, fc_sc, "XGB Regressor (SC)",   "reg_sc")
+        plot_partial_dependence(clf_sc, X_sc_tr, fc_sc, "XGB Classifier (SC)",  "clf_sc")
+
+        log.info(f"\nAll diagnostic plots saved to: {DIAG_DIR}")
         log.info("=" * 60)
-        log.info("All diagnostics complete. Plots saved to artifacts/")
+        log.info("Diagnostics complete.")
         log.info("=" * 60)
-
-        return full_results, sc_results
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 if __name__ == "__main__":
-    full_results, sc_results = run_diagnostics()
-
-    print("\n--- FULL DATASET TEST RESULTS ---")
-    print(f"Regression  MAE  : {full_results['test_mae']:.4f}s")
-    print(f"Regression  R2   : {full_results['test_r2']:.4f}")
-    print(f"Classifier  AUC  : {full_results['test_auc']:.4f}")
-    print(f"Classifier  F1   : {full_results['test_f1']:.4f}")
-
-    print("\n--- SAME-COMPOUND TEST RESULTS ---")
-    print(f"Regression  MAE  : {sc_results['sc_test_mae']:.4f}s")
-    print(f"Regression  R2   : {sc_results['sc_test_r2']:.4f}")
-    print(f"Classifier  AUC  : {sc_results['sc_test_auc']:.4f}")
-    print(f"Classifier  F1   : {sc_results['sc_test_f1']:.4f}")
-
-    print("\n--- IMPROVEMENT SUMMARY ---")
-    reg_improvement = full_results['test_mae'] - sc_results['sc_test_mae']
-    auc_improvement = sc_results['sc_test_auc'] - full_results['test_auc']
-    print(f"Regression MAE improved by : {reg_improvement:+.4f}s "
-          f"({'better' if reg_improvement > 0 else 'worse'})")
-    print(f"Classifier AUC shifted by  : {auc_improvement:+.4f} "
-          f"({'better' if auc_improvement > 0 else 'worse'})")
+    run_diagnostics()

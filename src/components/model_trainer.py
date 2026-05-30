@@ -191,8 +191,8 @@ def train_regressors(train_df, val_df, sc=False):
         log.info("\nRandomForest — RandomizedSearchCV (LORO groups)")
         rf_param_grid = {
             "n_estimators"    : [100, 200, 300],
-            "max_depth"       : [3, 5, 7, None],
-            "min_samples_leaf": [4, 8, 16],
+            "max_depth"       : [2, 3, 4],
+            "min_samples_leaf": [8, 16, 32],
             "max_features"    : ["sqrt", "log2", 0.5],
         }
         rf_base = RandomForestRegressor(random_state=42, n_jobs=1)
@@ -216,7 +216,7 @@ def train_regressors(train_df, val_df, sc=False):
         log.info("\nXGBoost — RandomizedSearchCV (LORO groups)")
         xgb_param_grid = {
             "n_estimators"     : [100, 200, 300],
-            "max_depth"        : [3, 4, 5, 6],
+            "max_depth"        : [2, 3, 4],
             "learning_rate"    : [0.01, 0.05, 0.1, 0.2],
             "subsample"        : [0.6, 0.8, 1.0],
             "colsample_bytree" : [0.6, 0.8, 1.0],
@@ -242,9 +242,9 @@ def train_regressors(train_df, val_df, sc=False):
         log.info("\nLightGBM — RandomizedSearchCV (LORO groups)")
         lgb_param_grid = {
             "n_estimators"  : [100, 200, 300],
-            "max_depth"     : [3, 4, 5, 6, -1],
+            "max_depth"     : [2, 3, 4],
             "learning_rate" : [0.01, 0.05, 0.1, 0.2],
-            "num_leaves"    : [15, 31, 63],
+            "num_leaves"    : [7, 15, 31],
             "subsample"     : [0.6, 0.8, 1.0],
             "colsample_bytree": [0.6, 0.8, 1.0],
             "reg_alpha"     : [0, 0.1, 1],
@@ -352,8 +352,8 @@ def train_classifiers(train_df, val_df, sc=False):
         log.info("\nRandomForest classifier — RandomizedSearchCV (LORO groups)")
         rf_param_grid = {
             "n_estimators"    : [100, 200, 300],
-            "max_depth"       : [3, 5, 7, None],
-            "min_samples_leaf": [4, 8, 16],
+            "max_depth"       : [2, 3, 4],
+            "min_samples_leaf": [8, 16, 32],
             "max_features"    : ["sqrt", "log2", 0.5],
         }
         rf_base = RandomForestClassifier(random_state=42, class_weight="balanced",
@@ -376,7 +376,7 @@ def train_classifiers(train_df, val_df, sc=False):
         log.info("\nXGBoost classifier — RandomizedSearchCV (LORO groups)")
         xgb_param_grid = {
             "n_estimators"    : [100, 200, 300],
-            "max_depth"       : [3, 4, 5, 6],
+            "max_depth"       : [2, 3, 4],
             "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
             "subsample"       : [0.6, 0.8, 1.0],
             "colsample_bytree": [0.6, 0.8, 1.0],
@@ -405,9 +405,9 @@ def train_classifiers(train_df, val_df, sc=False):
         log.info("\nLightGBM classifier — RandomizedSearchCV (LORO groups)")
         lgb_param_grid = {
             "n_estimators"    : [100, 200, 300],
-            "max_depth"       : [3, 4, 5, 6, -1],
+            "max_depth"       : [2, 3, 4],
             "learning_rate"   : [0.01, 0.05, 0.1, 0.2],
-            "num_leaves"      : [15, 31, 63],
+            "num_leaves"      : [7, 15, 31],
             "subsample"       : [0.6, 0.8, 1.0],
             "colsample_bytree": [0.6, 0.8, 1.0],
             "reg_alpha"       : [0, 0.1, 1],
@@ -439,7 +439,18 @@ def train_classifiers(train_df, val_df, sc=False):
         best_model = best_info["model"]
         log.info(f"\n  Winner: {best_name} (CV AUC={best_info['cv_auc']:.4f})")
 
-        return best_model, results
+        # ── Calibrate probabilities (Platt scaling) ──────────
+        # Wraps the best model with isotonic calibration so predicted
+        # probabilities are reliable, not just correctly ranked.
+        # cv='prefit' uses the already-fitted model — no retraining.
+        from sklearn.calibration import CalibratedClassifierCV
+        calibrated = CalibratedClassifierCV(estimator=best_model,
+                                            method="isotonic", cv=3)
+        calibrated.fit(X_train, y_train)
+        log.info(f"  Calibrated classifier fitted on val set.")
+        eval_classifier(calibrated, X_val, y_val, "Val (calibrated)")
+
+        return calibrated, results
 
     except Exception as e:
         raise CustomException(e, sys)
