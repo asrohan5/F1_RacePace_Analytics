@@ -144,8 +144,8 @@ def train_regressors(train_df, val_df, sc=False):
         dummy_cv = loro_cv_score(dummy, X_train, y_train, groups,
                                  scoring="neg_mean_absolute_error")
         log.info(f"  CV MAE: {-dummy_cv.mean():.4f}s ± {dummy_cv.std():.4f}s")
-        eval_regressor(dummy, X_val, y_val, "Val")
-        results["dummy"] = {"model": dummy, "cv_mae": -dummy_cv.mean()}
+        _, dummy_val_r2 = eval_regressor(dummy, X_val, y_val, "Val")
+        results["dummy"] = {"model": dummy, "cv_mae": -dummy_cv.mean(), "val_r2": dummy_val_r2}
 
         # ── Linear models ───────────────────────────────────
         log.info("\nLinearRegression")
@@ -154,8 +154,8 @@ def train_regressors(train_df, val_df, sc=False):
         lr_cv = loro_cv_score(lr, X_train, y_train, groups,
                               scoring="neg_mean_absolute_error")
         log.info(f"  CV MAE: {-lr_cv.mean():.4f}s ± {lr_cv.std():.4f}s")
-        eval_regressor(lr, X_val, y_val, "Val")
-        results["linear"] = {"model": lr, "cv_mae": -lr_cv.mean()}
+        _, lr_val_r2 = eval_regressor(lr, X_val, y_val, "Val")
+        results["linear"] = {"model": lr, "cv_mae": -lr_cv.mean(), "val_r2": lr_val_r2}
 
         log.info("\nRidgeCV (alphas=[0.01, 0.1, 1, 10, 100])")
         ridge = RidgeCV(alphas=[0.01, 0.1, 1, 10, 100], cv=5)
@@ -164,8 +164,8 @@ def train_regressors(train_df, val_df, sc=False):
                                  scoring="neg_mean_absolute_error")
         log.info(f"  Best alpha: {ridge.alpha_:.4f}")
         log.info(f"  CV MAE: {-ridge_cv.mean():.4f}s ± {ridge_cv.std():.4f}s")
-        eval_regressor(ridge, X_val, y_val, "Val")
-        results["ridge"] = {"model": ridge, "cv_mae": -ridge_cv.mean()}
+        _, ridge_val_r2 = eval_regressor(ridge, X_val, y_val, "Val")
+        results["ridge"] = {"model": ridge, "cv_mae": -ridge_cv.mean(), "val_r2": ridge_val_r2}
 
         log.info("\nLassoCV (feature selection insight)")
         lasso = LassoCV(alphas=[0.001, 0.01, 0.1, 1, 10], cv=5, max_iter=5000)
@@ -176,8 +176,8 @@ def train_regressors(train_df, val_df, sc=False):
         lasso_cv = loro_cv_score(lasso, X_train, y_train, groups,
                                  scoring="neg_mean_absolute_error")
         log.info(f"  CV MAE: {-lasso_cv.mean():.4f}s ± {lasso_cv.std():.4f}s")
-        eval_regressor(lasso, X_val, y_val, "Val")
-        results["lasso"] = {"model": lasso, "cv_mae": -lasso_cv.mean()}
+        _, lasso_val_r2 = eval_regressor(lasso, X_val, y_val, "Val")
+        results["lasso"] = {"model": lasso, "cv_mae": -lasso_cv.mean(), "val_r2": lasso_val_r2}
 
         # Log which features Lasso kept
         kept = [(feature_cols[i], round(lasso.coef_[i], 4))
@@ -209,8 +209,8 @@ def train_regressors(train_df, val_df, sc=False):
         rf_cv_mae = -rf_search.best_score_
         log.info(f"  Best params : {rf_search.best_params_}")
         log.info(f"  CV MAE      : {rf_cv_mae:.4f}s")
-        eval_regressor(best_rf, X_val, y_val, "Val")
-        results["rf"] = {"model": best_rf, "cv_mae": rf_cv_mae}
+        _, rf_val_r2 = eval_regressor(best_rf, X_val, y_val, "Val")
+        results["rf"] = {"model": best_rf, "cv_mae": rf_cv_mae, "val_r2": rf_val_r2}
 
         # ── XGBoost ─────────────────────────────────────────
         log.info("\nXGBoost — RandomizedSearchCV (LORO groups)")
@@ -235,8 +235,8 @@ def train_regressors(train_df, val_df, sc=False):
         xgb_cv_mae = -xgb_search.best_score_
         log.info(f"  Best params : {xgb_search.best_params_}")
         log.info(f"  CV MAE      : {xgb_cv_mae:.4f}s")
-        eval_regressor(best_xgb, X_val, y_val, "Val")
-        results["xgb"] = {"model": best_xgb, "cv_mae": xgb_cv_mae}
+        _, xgb_val_r2 = eval_regressor(best_xgb, X_val, y_val, "Val")
+        results["xgb"] = {"model": best_xgb, "cv_mae": xgb_cv_mae, "val_r2": xgb_val_r2}
 
         # ── LightGBM ────────────────────────────────────────
         log.info("\nLightGBM — RandomizedSearchCV (LORO groups)")
@@ -262,18 +262,40 @@ def train_regressors(train_df, val_df, sc=False):
         lgb_cv_mae = -lgb_search.best_score_
         log.info(f"  Best params : {lgb_search.best_params_}")
         log.info(f"  CV MAE      : {lgb_cv_mae:.4f}s")
-        eval_regressor(best_lgb, X_val, y_val, "Val")
-        results["lgb"] = {"model": best_lgb, "cv_mae": lgb_cv_mae}
+        _, lgb_val_r2 = eval_regressor(best_lgb, X_val, y_val, "Val")
+        results["lgb"] = {"model": best_lgb, "cv_mae": lgb_cv_mae, "val_r2": lgb_val_r2}
 
-        # ── Select best by CV MAE ────────────────────────────
+        # ── Select best: CV MAE primary, val R² tiebreaker ──
+        # If two models are within TIEBREAK_THRESHOLD of the best CV MAE,
+        # prefer the one with higher val R² — it generalises better to
+        # unseen races (the CV gap is within noise at that margin).
+        TIEBREAK_THRESHOLD = 0.01  # seconds
+
         log.info("\n--- REGRESSION SUMMARY (ranked by CV MAE) ---")
         ranked = sorted(results.items(), key=lambda x: x[1]["cv_mae"])
         for name, info in ranked:
-            log.info(f"  {name:<10} CV MAE={info['cv_mae']:.4f}s")
+            log.info(f"  {name:<10} CV MAE={info['cv_mae']:.4f}s  "
+                     f"Val R²={info['val_r2']:.4f}")
 
-        best_name, best_info = ranked[0]
+        best_cv_mae = ranked[0][1]["cv_mae"]
+        candidates  = [(n, i) for n, i in ranked
+                       if i["cv_mae"] <= best_cv_mae + TIEBREAK_THRESHOLD]
+
+        if len(candidates) > 1:
+            log.info(f"\n  {len(candidates)} models within {TIEBREAK_THRESHOLD}s "
+                     f"of best CV MAE — applying val R² tiebreaker")
+            candidates_sorted = sorted(candidates,
+                                       key=lambda x: x[1]["val_r2"], reverse=True)
+            best_name, best_info = candidates_sorted[0]
+            candidate_summary = [(n, f"CV={i['cv_mae']:.4f} R2={i['val_r2']:.4f}")
+                                  for n, i in candidates]
+            log.info(f"  Tiebreaker candidates: {candidate_summary}")
+        else:
+            best_name, best_info = ranked[0]
+
         best_model = best_info["model"]
-        log.info(f"\n  Winner: {best_name} (CV MAE={best_info['cv_mae']:.4f}s)")
+        log.info(f"\n  Winner: {best_name} "
+                 f"(CV MAE={best_info['cv_mae']:.4f}s  Val R²={best_info['val_r2']:.4f})")
 
         return best_model, results
 
