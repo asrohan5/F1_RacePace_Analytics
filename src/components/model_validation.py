@@ -1,523 +1,722 @@
 import os
 import sys
 import pickle
+import warnings
+warnings.filterwarnings("ignore")
+
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
 
 from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error, r2_score,
-    accuracy_score, f1_score, roc_auc_score,
-    confusion_matrix, classification_report
+    mean_absolute_error, r2_score,
+    roc_auc_score, f1_score, accuracy_score,
+    confusion_matrix, roc_curve, precision_recall_curve,
 )
-from sklearn.model_selection import cross_val_score, KFold, StratifiedKFold
 
 from src.logger import logging as log
 from src.exception import CustomException
 from src.config import (
-    TRAIN_PATH, VAL_PATH,
+    TRAIN_PATH, VAL_PATH, TEST_PATH,
+    TRAIN_SC_PATH, VAL_SC_PATH, TEST_SC_PATH,
     REGRESSOR_PATH, CLASSIFIER_PATH,
-    TARGET_REGRESSION, TARGET_CLASSIFICATION
+    REGRESSOR_SC_PATH, CLASSIFIER_SC_PATH,
+    ARTIFACTS_DIR,
+    TARGET_REGRESSION, TARGET_CLASSIFICATION,FEATURES_SAME_COMPOUND_PATH, FEATURES_PATH
 )
-import warnings
-warnings.filterwarnings('ignore')
-
-
-
-
-FEATURE_COLS = [
-    "coasting_pct_delta", "full_throttle_pct_delta", "gear_shifts_delta",
-    "avg_brake_zone_length_delta", "avg_entry_speed_delta",
-    "brake_zone_count_delta", "tyre_life_delta", "tyre_life_x_coasting_delta",
-    "stint_phase_delta", "abu_dhabi_gear_delta", "rolling_delta_3",
-    "VER_coasting_pct", "HAM_coasting_pct",
-    "VER_full_throttle_pct", "HAM_full_throttle_pct",
-    "VER_gear_shifts", "HAM_gear_shifts",
-    "VER_avg_brake_zone_length", "HAM_avg_brake_zone_length",
-    "VER_avg_entry_speed", "HAM_avg_entry_speed",
-    "VER_TyreLife", "HAM_TyreLife",
-    "VER_stint_phase", "HAM_stint_phase",
-    "same_compound", "VER_compound_enc", "HAM_compound_enc",
-    "LapNumber", "race_enc"
-]
-
 
 # ─────────────────────────────────────────
-# LOAD DATA AND MODELS
+# PATHS
+# ─────────────────────────────────────────
+PLOTS_DIR = os.path.join(ARTIFACTS_DIR, "validation_plots")
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+ID_COLS = ["Race", "RoundNumber", "LapNumber",
+           TARGET_REGRESSION, TARGET_CLASSIFICATION]
+
+def get_feature_cols(df):
+    return [c for c in df.columns if c not in ID_COLS]
+
+# ─────────────────────────────────────────
+# STYLE
+# ─────────────────────────────────────────
+plt.rcParams.update({
+    "figure.facecolor" : "#0f0f0f",
+    "axes.facecolor"   : "#1a1a1a",
+    "axes.edgecolor"   : "#444444",
+    "axes.labelcolor"  : "#cccccc",
+    "axes.titlecolor"  : "#ffffff",
+    "xtick.color"      : "#888888",
+    "ytick.color"      : "#888888",
+    "text.color"       : "#cccccc",
+    "grid.color"       : "#2a2a2a",
+    "grid.linewidth"   : 0.6,
+    "font.size"        : 10,
+    "axes.titlesize"   : 12,
+    "axes.labelsize"   : 10,
+    "legend.framealpha": 0.3,
+    "legend.edgecolor" : "#444444",
+})
+
+VER_COLOR  = "#3671C6"   # Red Bull blue
+HAM_COLOR  = "#00D2BE"   # Mercedes teal
+NEUTRAL    = "#e8e8e8"
+ACCENT     = "#ff6b35"
+GREY       = "#555555"
+
+# ─────────────────────────────────────────
+# LOAD
 # ─────────────────────────────────────────
 
-def load_data_and_models():
+def load_all():
     try:
-        train = pd.read_csv(TRAIN_PATH)
-        val   = pd.read_csv(VAL_PATH)
+        train    = pd.read_csv(TRAIN_PATH)
+        val      = pd.read_csv(VAL_PATH)
+        test     = pd.read_csv(TEST_PATH)
+        sc_train = pd.read_csv(TRAIN_SC_PATH)
+        sc_val   = pd.read_csv(VAL_SC_PATH)
+        sc_test  = pd.read_csv(TEST_SC_PATH)
 
-        with open(REGRESSOR_PATH,  "rb") as f:
-            regressor = pickle.load(f)
-        with open(CLASSIFIER_PATH, "rb") as f:
-            classifier = pickle.load(f)
+        with open(REGRESSOR_PATH,    "rb") as f: reg     = pickle.load(f)
+        with open(CLASSIFIER_PATH,   "rb") as f: clf     = pickle.load(f)
+        with open(REGRESSOR_SC_PATH, "rb") as f: reg_sc  = pickle.load(f)
+        with open(CLASSIFIER_SC_PATH,"rb") as f: clf_sc  = pickle.load(f)
 
-        log.info(f"Train: {train.shape} | Val: {val.shape}")
-        log.info(f"Regressor  loaded : {type(regressor).__name__}")
-        log.info(f"Classifier loaded : {type(classifier).__name__}")
-
-        return train, val, regressor, classifier
+        log.info("All splits and models loaded.")
+        return (train, val, test, sc_train, sc_val, sc_test,
+                reg, clf, reg_sc, clf_sc)
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# SECTION 1 — TRAIN vs VAL SCORE GAP
-# The single most important overfitting check
+# METRICS
 # ─────────────────────────────────────────
 
-def check_train_val_gap(model, X_train, y_train, X_val, y_val,
-                        task, metric_fn, metric_name):
+def regression_metrics(model, X, y, label):
+    pred = model.predict(X)
+    mae  = mean_absolute_error(y, pred)
+    r2   = r2_score(y, pred)
+    bias = np.mean(pred - y)
+    log.info(f"  [{label}] MAE={mae:.4f}s  R²={r2:.4f}  Bias={bias:+.4f}s")
+    return pred, mae, r2, bias
+
+
+def classification_metrics(model, X, y, label):
+    pred      = model.predict(X)
+    pred_prob = model.predict_proba(X)[:, 1]
+    acc  = accuracy_score(y, pred)
+    f1   = f1_score(y, pred, zero_division=0)
+    auc  = roc_auc_score(y, pred_prob)
+    cm   = confusion_matrix(y, pred)
+    log.info(f"  [{label}] Acc={acc:.4f}  F1={f1:.4f}  AUC={auc:.4f}")
+    return pred, pred_prob, acc, f1, auc, cm
+
+
+# ─────────────────────────────────────────
+# PLOT 1 — REGRESSION: PREDICTED VS ACTUAL
+# One panel per split (train / val / test)
+# Both full and SC model
+# ─────────────────────────────────────────
+
+def plot_pred_vs_actual(splits_data, model_label, filename):
     """
-    Compute train score and val score side by side.
-    A large gap = overfitting. Both scores high = good fit.
-    Both scores low = underfitting.
+    splits_data: list of (split_label, y_true, y_pred, mae, r2)
     """
     try:
-        log.info("-" * 50)
-        log.info(f"TRAIN vs VAL GAP — {task} ({metric_name})")
-        log.info("-" * 50)
+        n = len(splits_data)
+        fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
+        if n == 1:
+            axes = [axes]
 
-        train_pred = model.predict(X_train)
-        val_pred   = model.predict(X_val)
+        fig.suptitle(f"Predicted vs Actual — {model_label}", fontsize=13,
+                     color=NEUTRAL, y=1.01)
 
-        train_score = metric_fn(y_train, train_pred)
-        val_score   = metric_fn(y_val,   val_pred)
-        gap         = abs(train_score - val_score)
+        for ax, (split_label, y_true, y_pred, mae, r2) in zip(axes, splits_data):
+            lim = max(abs(y_true).max(), abs(y_pred).max()) * 1.1
+            ax.scatter(y_true, y_pred, alpha=0.55, s=18,
+                       color=VER_COLOR, edgecolors="none")
+            ax.plot([-lim, lim], [-lim, lim], "--", color=ACCENT,
+                    linewidth=1.2, label="Perfect")
+            ax.axhline(0, color=GREY, linewidth=0.6, linestyle=":")
+            ax.axvline(0, color=GREY, linewidth=0.6, linestyle=":")
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_xlabel("Actual Δ lap time (s)")
+            ax.set_ylabel("Predicted Δ lap time (s)")
+            ax.set_title(f"{split_label}\nMAE={mae:.3f}s  R²={r2:.3f}")
+            ax.legend(fontsize=8)
+            ax.grid(True)
 
-        log.info(f"  Train {metric_name} : {train_score:.4f}")
-        log.info(f"  Val   {metric_name} : {val_score:.4f}")
-        log.info(f"  Gap               : {gap:.4f}")
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
+    except Exception as e:
+        raise CustomException(e, sys)
 
-        # Interpret the gap
-        if task == "regression":
-            if gap > 0.15:
-                log.info("  TRAIN-VAL GAP: Large (>{:.3f}s) — suggests overfitting on train.".format(gap))
-            else:
-                log.info("  TRAIN-VAL GAP: Small ({:.3f}s) — but val set has only 21 rows.".format(gap))
-                log.info("  NOTE: Small gap on 21 rows is not evidence of good generalisation.")
-                log.info("        Check CV MAE for the honest estimate.")
+
+# ─────────────────────────────────────────
+# PLOT 2 — RESIDUALS BY RACE
+# Shows which races the model struggles on
+# ─────────────────────────────────────────
+
+def plot_residuals_by_race(df_split, y_pred, split_label, model_label, filename):
+    try:
+        df = df_split.copy()
+        df["residual"] = y_pred - df[TARGET_REGRESSION].values
+
+        race_order = (df.groupby("Race")["residual"]
+                      .apply(lambda x: x.abs().mean())
+                      .sort_values(ascending=False).index.tolist())
+
+        fig, ax = plt.subplots(figsize=(max(10, len(race_order) * 0.7), 5))
+        sns.boxplot(data=df, x="Race", y="residual", order=race_order,
+                    color=VER_COLOR, linecolor=NEUTRAL, linewidth=0.8,
+                    fliersize=3, ax=ax)
+        ax.axhline(0, color=ACCENT, linewidth=1.2, linestyle="--")
+        ax.set_title(f"Residuals by Race — {model_label} ({split_label})")
+        ax.set_xlabel("")
+        ax.set_ylabel("Residual (pred − actual, s)")
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(True, axis="y")
+
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# PLOT 3 — ROC + PRECISION-RECALL
+# ─────────────────────────────────────────
+
+def plot_roc_pr(y_true, y_prob, split_label, model_label, filename):
+    try:
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        auc_val     = roc_auc_score(y_true, y_prob)
+        prec, rec, _= precision_recall_curve(y_true, y_prob)
+        baseline_pr = y_true.mean()
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5))
+        fig.suptitle(f"ROC & PR Curves — {model_label} ({split_label})",
+                     color=NEUTRAL)
+
+        # ROC
+        ax1.plot(fpr, tpr, color=VER_COLOR, linewidth=2,
+                 label=f"AUC = {auc_val:.3f}")
+        ax1.plot([0, 1], [0, 1], "--", color=GREY, linewidth=1)
+        ax1.set_xlabel("False Positive Rate")
+        ax1.set_ylabel("True Positive Rate")
+        ax1.set_title("ROC Curve")
+        ax1.legend()
+        ax1.grid(True)
+
+        # PR
+        ax2.plot(rec, prec, color=HAM_COLOR, linewidth=2)
+        ax2.axhline(baseline_pr, color=GREY, linestyle="--", linewidth=1,
+                    label=f"Baseline ({baseline_pr:.2f})")
+        ax2.set_xlabel("Recall")
+        ax2.set_ylabel("Precision")
+        ax2.set_title("Precision-Recall Curve")
+        ax2.legend()
+        ax2.grid(True)
+
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# PLOT 4 — CONFUSION MATRIX
+# ─────────────────────────────────────────
+
+def plot_confusion_matrix(cm, split_label, model_label, filename):
+    try:
+        fig, ax = plt.subplots(figsize=(4.5, 4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=["HAM faster", "VER faster"],
+                    yticklabels=["HAM faster", "VER faster"],
+                    linewidths=0.5, ax=ax,
+                    annot_kws={"size": 13, "color": NEUTRAL})
+        ax.set_title(f"Confusion Matrix — {model_label} ({split_label})")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+# ─────────────────────────────────────────
+# PLOT 5 — FEATURE IMPORTANCE
+# Tree-based models: built-in gain importance
+# ─────────────────────────────────────────
+
+def plot_feature_importance(model, feature_cols, model_label, filename,
+                             top_n=20):
+    try:
+        if hasattr(model, "feature_importances_"):
+            importances = model.feature_importances_
         else:
-            gap_pct = abs(train_score - val_score)
-            if train_score > val_score + 0.10:
-                log.info("  TRAIN-VAL GAP: Large — train F1 significantly above val F1.")
-                log.info("  NOTE: This suggests memorisation of train laps.")
-            elif train_score < 0.60 and val_score < 0.60:
-                log.info("  TRAIN-VAL GAP: Both scores low — model is not learning the signal.")
-            else:
-                log.info("  TRAIN-VAL GAP: Small ({:.4f}) — but val set has only 21 rows.".format(
-                    gap_pct))
-                log.info("  NOTE: Val F1 on 21 rows is unreliable regardless of gap size.")
-                log.info("        A perfect val F1 on 21 rows means nothing statistically.")
-                log.info("        CV F1 is the only honest metric — check FIT SUMMARY below.")
+            log.warning(f"  {model_label} has no feature_importances_, skipping")
+            return
 
-        return train_score, val_score, gap
+        fi = pd.Series(importances, index=feature_cols).sort_values(ascending=True)
+        fi = fi.tail(top_n)
 
+        fig, ax = plt.subplots(figsize=(7, top_n * 0.35 + 1))
+        colors = [VER_COLOR if v >= fi.median() else GREY for v in fi.values]
+        fi.plot(kind="barh", ax=ax, color=colors, edgecolor="none")
+        ax.set_title(f"Feature Importance (gain) — {model_label} | top {top_n}")
+        ax.set_xlabel("Importance")
+        ax.grid(True, axis="x")
+        ax.tick_params(axis="y", labelsize=8)
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
     except Exception as e:
         raise CustomException(e, sys)
 
 
 # ─────────────────────────────────────────
-# SECTION 2 — CROSS VALIDATION ON FULL TRAIN
-# More reliable than a single val split given small data
+# PLOT 6 — TRAIN/VAL/TEST METRIC SUMMARY
+# Side-by-side bars for MAE (regression) and AUC (classification)
 # ─────────────────────────────────────────
 
-def cross_validate_models(regressor, classifier,
-                           X_train, y_train_reg, y_train_clf, train_df):
+def plot_metric_summary(metric_rows, ylabel, title, filename):
+    """
+    metric_rows: list of (split_label, full_val, sc_val)
+    """
     try:
-        log.info("-" * 50)
-        log.info("CROSS VALIDATION — Chronological (respects time ordering)")
-        log.info("-" * 50)
+        labels = [r[0] for r in metric_rows]
+        full   = [r[1] for r in metric_rows]
+        sc     = [r[2] for r in metric_rows]
+        x      = np.arange(len(labels))
+        w      = 0.35
 
-        # ── Custom chronological CV per race ──
-        # For each race: train on first 70%, validate on remaining 30%
-        # Then aggregate — this avoids leaking future laps into training
-        races = train_df["Race"].unique()
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(x - w/2, full, w, color=VER_COLOR, label="Full model",
+               edgecolor="none")
+        ax.bar(x + w/2, sc,   w, color=HAM_COLOR, label="SC model",
+               edgecolor="none")
 
-        reg_mae_folds  = []
-        reg_rmse_folds = []
-        reg_r2_folds   = []
-        clf_f1_folds   = []
-        clf_auc_folds  = []
-        clf_acc_folds  = []
+        for xi, v in zip(x - w/2, full):
+            ax.text(xi, v + 0.003, f"{v:.3f}", ha="center",
+                    va="bottom", fontsize=8, color=NEUTRAL)
+        for xi, v in zip(x + w/2, sc):
+            ax.text(xi, v + 0.003, f"{v:.3f}", ha="center",
+                    va="bottom", fontsize=8, color=NEUTRAL)
 
-        for race in races:
-            race_mask = train_df["Race"].values == race
-            race_idx  = np.where(race_mask)[0]
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, axis="y")
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
+    except Exception as e:
+        raise CustomException(e, sys)
 
-            if len(race_idx) < 10:
-                log.info(f"  {race}: too few samples ({len(race_idx)}) — skipping")
-                continue
 
-            # Chronological split within this race
-            split_point = int(len(race_idx) * 0.70)
-            train_idx   = race_idx[:split_point]
-            val_idx     = race_idx[split_point:]
+# ─────────────────────────────────────────
+# PLOT 7 — ROLLING DELTA: ACTUAL VS PREDICTED
+# Abu Dhabi test set only — lap-by-lap comparison
+# ─────────────────────────────────────────
 
-            X_tr = X_train[train_idx]
-            X_vl = X_train[val_idx]
-            y_tr_reg = y_train_reg[train_idx]
-            y_vl_reg = y_train_reg[val_idx]
-            y_tr_clf = y_train_clf[train_idx]
-            y_vl_clf = y_train_clf[val_idx]
 
-            # Regression fold
-            import pickle as pkl
-            reg_copy = pkl.loads(pkl.dumps(regressor))
-            reg_copy.fit(X_tr, y_tr_reg)
-            fold_pred_reg = reg_copy.predict(X_vl)
-            reg_mae_folds.append(mean_absolute_error(y_vl_reg, fold_pred_reg))
-            reg_rmse_folds.append(mean_squared_error(y_vl_reg, fold_pred_reg)**0.5)
-            reg_r2_folds.append(r2_score(y_vl_reg, fold_pred_reg))
+def plot_abu_dhabi_trace(test_raw, reg_pred, reg_sc_pred,
+                          sc_test_raw, filename):
+    try:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=False)
+        fig.suptitle("Abu Dhabi 2021 — Predicted vs Actual Lap Time Delta",
+                     color=NEUTRAL, fontsize=13)
 
-            # Classification fold
-            clf_copy = pkl.loads(pkl.dumps(classifier))
-            clf_copy.fit(X_tr, y_tr_clf)
-            fold_pred_clf   = clf_copy.predict(X_vl)
-            fold_proba_clf  = (clf_copy.predict_proba(X_vl)[:, 1]
-                               if hasattr(clf_copy, "predict_proba")
-                               else fold_pred_clf.astype(float))
+        # Sort by LapNumber so trace reads left-to-right
+        test_sorted = test_raw.sort_values("LapNumber").reset_index(drop=True)
+        sc_sorted   = sc_test_raw.sort_values("LapNumber").reset_index(drop=True)
 
-            clf_acc_folds.append(accuracy_score(y_vl_clf, fold_pred_clf))
-            clf_f1_folds.append( f1_score(y_vl_clf, fold_pred_clf, zero_division=0))
+        # Use actual lap numbers as x-tick labels but integer positions as x
+        laps_full   = test_sorted["LapNumber"].astype(int).values
+        actual_full = test_sorted[TARGET_REGRESSION].values
+        reg_pred_sorted = reg_pred[test_sorted.index]  # align predictions
 
-            if len(np.unique(y_vl_clf)) > 1:
-                clf_auc_folds.append(roc_auc_score(y_vl_clf, fold_proba_clf))
-            else:
-                log.warning(f"  {race} val fold has only one class — AUC skipped")
+        laps_sc   = sc_sorted["LapNumber"].astype(int).values
+        actual_sc = sc_sorted[TARGET_REGRESSION].values
+        reg_sc_pred_sorted = reg_sc_pred[sc_sorted.index]
 
-            log.info(f"  {race}: reg_mae={reg_mae_folds[-1]:.4f}  "
-                     f"clf_f1={clf_f1_folds[-1]:.4f}")
+        x_full = np.arange(len(laps_full))
+        x_sc   = np.arange(len(laps_sc))
 
-        reg_mae_arr  = np.array(reg_mae_folds)
-        reg_rmse_arr = np.array(reg_rmse_folds)
-        reg_r2_arr   = np.array(reg_r2_folds)
-        clf_acc_arr  = np.array(clf_acc_folds)
-        clf_f1_arr   = np.array(clf_f1_folds)
-        clf_auc_arr  = np.array(clf_auc_folds) if clf_auc_folds else np.array([0.0])
+        ax1.plot(x_full, actual_full, color=NEUTRAL, linewidth=1.5,
+                 label="Actual Δ", marker="o", markersize=3)
+        ax1.plot(x_full, reg_pred_sorted, color=VER_COLOR, linewidth=1.5,
+                 label="Predicted Δ (Full)", linestyle="--", marker="s", markersize=3)
+        ax1.axhline(0, color=GREY, linewidth=0.8, linestyle=":")
+        ax1.set_xticks(x_full[::3])
+        ax1.set_xticklabels(x_full[::3] + 1)
+        ax1.set_ylabel("Δ lap time (s)\n(VER − HAM)")
+        ax1.set_title(f"Full model  |  MAE={mean_absolute_error(actual_full, reg_pred_sorted):.3f}s")
+        ax1.legend(fontsize=8)
+        ax1.grid(True)
 
-        log.info(f"\n  Regressor  Chrono-CV MAE  : "
-                 f"{reg_mae_arr.mean():.4f} ± {reg_mae_arr.std():.4f}")
-        log.info(f"  Regressor  Chrono-CV RMSE : "
-                 f"{reg_rmse_arr.mean():.4f} ± {reg_rmse_arr.std():.4f}")
-        log.info(f"  Regressor  Chrono-CV R2   : "
-                 f"{reg_r2_arr.mean():.4f} ± {reg_r2_arr.std():.4f}")
-        log.info(f"  Classifier Chrono-CV Acc  : "
-                 f"{clf_acc_arr.mean():.4f} ± {clf_acc_arr.std():.4f}")
-        log.info(f"  Classifier Chrono-CV F1   : "
-                 f"{clf_f1_arr.mean():.4f} ± {clf_f1_arr.std():.4f}")
-        log.info(f"  Classifier Chrono-CV AUC  : "
-                 f"{clf_auc_arr.mean():.4f} ± {clf_auc_arr.std():.4f}")
+        ax2.plot(x_sc, actual_sc, color=NEUTRAL, linewidth=1.5,
+                 label="Actual Δ", marker="o", markersize=3)
+        ax2.plot(x_sc, reg_sc_pred_sorted, color=HAM_COLOR, linewidth=1.5,
+                 label="Predicted Δ (SC)", linestyle="--", marker="s", markersize=3)
+        ax2.axhline(0, color=GREY, linewidth=0.8, linestyle=":")
+        ax2.set_xticks(x_sc[::3])
+        ax2.set_xticklabels(x_sc[::3] + 1)
+        ax2.set_xlabel("Lap Number")
+        ax2.set_ylabel("Δ lap time (s)\n(VER − HAM)")
+        ax2.set_title(f"SC model  |  MAE={mean_absolute_error(actual_sc, reg_sc_pred_sorted):.3f}s"
+                      f"  (n={len(sc_sorted)} SC laps)")
+        ax2.legend(fontsize=8)
+        ax2.grid(True)
 
-        return {
-            "reg_cv_mae"  : reg_mae_arr,
-            "reg_cv_rmse" : reg_rmse_arr,
-            "reg_cv_r2"   : reg_r2_arr,
-            "clf_cv_acc"  : clf_acc_arr,
-            "clf_cv_f1"   : clf_f1_arr,
-            "clf_cv_auc"  : clf_auc_arr,
-        }
-
+        plt.tight_layout()
+        path = os.path.join(PLOTS_DIR, filename)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"  Saved: {filename}")
     except Exception as e:
         raise CustomException(e, sys)
     
-
-# ─────────────────────────────────────────
-# SECTION 3 — DETAILED VAL SET DIAGNOSTICS
-# ─────────────────────────────────────────
-
-def detailed_val_diagnostics(regressor, classifier,
-                              X_val, y_val_reg, y_val_clf, val_df):
-    try:
-        log.info("-" * 50)
-        log.info("DETAILED VAL SET DIAGNOSTICS")
-        log.info("-" * 50)
-
-        # ── Regression ──
-        reg_pred   = regressor.predict(X_val)
-        residuals  = y_val_reg - reg_pred
-
-        log.info(f"\n  Regression residuals on val:")
-        log.info(f"    mean  = {residuals.mean():.4f}s  (bias — should be near 0)")
-        log.info(f"    std   = {residuals.std():.4f}s")
-        log.info(f"    max   = {residuals.max():.4f}s")
-        log.info(f"    min   = {residuals.min():.4f}s")
-
-        # Large residual laps — what went wrong
-        val_with_pred = val_df.copy()
-        val_with_pred["reg_pred"]  = reg_pred
-        val_with_pred["residual"]  = residuals
-
-        large_errors = val_with_pred[abs(val_with_pred["residual"]) > 0.5].sort_values(
-            "residual", key=abs, ascending=False
-        )[["Race", "LapNumber", TARGET_REGRESSION, "reg_pred", "residual",
-           "same_compound", "VER_compound_enc", "HAM_compound_enc"]]
-
-        log.info(f"\n  Laps with residual > 0.5s ({len(large_errors)} laps):")
-        if len(large_errors) > 0:
-            log.info(f"\n{large_errors.to_string(index=False)}")
-        else:
-            log.info("  None — all predictions within 0.5s.")
-
-        # ── Classification ──
-        clf_pred  = classifier.predict(X_val)
-        clf_proba = classifier.predict_proba(X_val)[:, 1]
-
-        cm = confusion_matrix(y_val_clf, clf_pred)
-        log.info(f"\n  Classification confusion matrix (val):")
-        log.info(f"    TN={cm[0,0]}  FP={cm[0,1]}")
-        log.info(f"    FN={cm[1,0]}  TP={cm[1,1]}")
-
-        report = classification_report(y_val_clf, clf_pred,
-                                        target_names=["HAM_faster", "VER_faster"])
-        log.info(f"\n  Classification report (val):\n{report}")
-
-        # Misclassified laps — what did the model get wrong
-        val_with_pred["clf_pred"]  = clf_pred
-        val_with_pred["clf_proba"] = clf_proba
-        wrong = val_with_pred[val_with_pred[TARGET_CLASSIFICATION] != clf_pred][
-            ["Race", "LapNumber", TARGET_CLASSIFICATION, "clf_pred", "clf_proba",
-             "same_compound", "coasting_pct_delta", "tyre_life_delta"]
-        ]
-        log.info(f"\n  Misclassified laps ({len(wrong)}):")
-        if len(wrong) > 0:
-            log.info(f"\n{wrong.to_string(index=False)}")
-        else:
-            log.info("  None — perfect classification on val.")
-
-        # ── Per-race breakdown ──
-        log.info(f"\n  Per-race val metrics:")
-        log.info(f"  {'Race':<12} {'MAE':>8} {'Acc':>8} {'N':>5}")
-        log.info(f"  {'-'*37}")
-        for race in val_df["Race"].unique():
-            mask     = val_df["Race"].values == race
-            if mask.sum() == 0:
-                continue
-            race_mae = mean_absolute_error(y_val_reg[mask], reg_pred[mask])
-            race_acc = accuracy_score(y_val_clf[mask], clf_pred[mask])
-            log.info(f"  {race:<12} {race_mae:>8.4f} {race_acc:>8.4f} {mask.sum():>5}")
-
-        return val_with_pred
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# SECTION 4 — LEARNING CURVE (manual)
-# Train on increasing subsets, track train vs val MAE
-# This is the definitive overfitting diagnostic
-# ─────────────────────────────────────────
-
-def compute_learning_curve(regressor, X_train, y_train_reg, X_val, y_val_reg):
-    try:
-        log.info("-" * 50)
-        log.info("LEARNING CURVE — Train vs Val MAE as training size increases")
-        log.info("-" * 50)
-
-        # Use increasing fractions of train data
-        fractions = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        n_train   = len(X_train)
-
-        curve_results = []
-
-        for frac in fractions:
-            n = max(10, int(n_train * frac))
-            X_sub = X_train[:n]
-            y_sub = y_train_reg[:n]
-
-            # Refit a fresh model with same params on the subset
-            import pickle as pkl
-            model_copy = pkl.loads(pkl.dumps(regressor))
-            model_copy.fit(X_sub, y_sub)
-
-            train_mae = mean_absolute_error(y_sub,       model_copy.predict(X_sub))
-            val_mae   = mean_absolute_error(y_val_reg,   model_copy.predict(X_val))
-
-            curve_results.append({
-                "n_samples" : n,
-                "train_mae" : round(train_mae, 4),
-                "val_mae"   : round(val_mae,   4),
-                "gap"       : round(abs(val_mae - train_mae), 4)
-            })
-
-            log.info(f"  n={n:>3} | train_mae={train_mae:.4f}  "
-                     f"val_mae={val_mae:.4f}  gap={abs(val_mae-train_mae):.4f}")
-
-        # Interpret final gap
-        final = curve_results[-1]
-        log.info(f"\n  Final gap at full training size: {final['gap']:.4f}s")
-
-        if final["gap"] > 0.15:
-            log.info("  VERDICT: OVERFITTING detected.")
-            log.info("  ACTION:  Increase min_samples_leaf, reduce max_depth, "
-                     "or add regularization before test evaluation.")
-        elif final["train_mae"] > 0.40:
-            log.info("  VERDICT: UNDERFITTING detected.")
-            log.info("  ACTION:  Engineer more features — "
-                     "consider stint_phase, rolling lap delta, or compound interaction terms.")
-        else:
-            log.info("  VERDICT: FIT IS ACCEPTABLE — proceed to model_diagnostics.py")
-
-        return curve_results
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
-# ─────────────────────────────────────────
-# SECTION 5 — OVERFITTING / UNDERFITTING SUMMARY
-# ─────────────────────────────────────────
-
-def print_fit_summary(train_reg_score, val_reg_score,
-                      train_clf_score, val_clf_score, cv_results):
-    try:
-        log.info("=" * 60)
-        log.info("FIT SUMMARY — FINAL VERDICT")
-        log.info("=" * 60)
-
-        reg_gap = abs(train_reg_score - val_reg_score)
-        clf_gap = abs(train_clf_score - val_clf_score)
-
-        log.info(f"\n  REGRESSION:")
-        log.info(f"    Train MAE : {train_reg_score:.4f}s")
-        log.info(f"    Val   MAE : {val_reg_score:.4f}s")
-        log.info(f"    Gap       : {reg_gap:.4f}s")
-        log.info(f"    CV MAE    : {cv_results['reg_cv_mae'].mean():.4f}s "
-                 f"± {cv_results['reg_cv_mae'].std():.4f}s")
-
-        log.info(f"\n  CLASSIFICATION:")
-        log.info(f"    Train F1  : {train_clf_score:.4f}")
-        log.info(f"    Val   F1  : {val_clf_score:.4f}")
-        log.info(f"    Gap       : {clf_gap:.4f}")
-        log.info(f"    CV F1     : {cv_results['clf_cv_f1'].mean():.4f} "
-                 f"± {cv_results['clf_cv_f1'].std():.4f}")
-
-        log.info("\n  RECOMMENDED NEXT STEP:")
-
-        # Regression verdict — CV MAE is the honest number, not train-val gap
-        if cv_results["reg_cv_mae"].mean() > 0.50:
-            log.info("  → Regression CV MAE is HIGH (>{:.3f}s). Model is NOT reliable.".format(
-                cv_results["reg_cv_mae"].mean()))
-            log.info("    Val MAE ({:.3f}s) is misleadingly low due to small val set (21 rows).".format(
-                val_reg_score))
-            log.info("    Do NOT use val MAE as performance claim. Use CV MAE.")
-            log.info("    Action: Phase 2 — more data is the only real fix.")
-        elif cv_results["reg_cv_mae"].mean() > 0.35:
-            log.info("  → Regression CV MAE is MODERATE ({:.3f}s ± {:.3f}s).".format(
-                cv_results["reg_cv_mae"].mean(), cv_results["reg_cv_mae"].std()))
-            log.info("    Acceptable for Phase 1 methodology proof. Not production-ready.")
-        else:
-            log.info("  → Regression CV MAE is ACCEPTABLE ({:.3f}s).".format(
-                cv_results["reg_cv_mae"].mean()))
-
-        # Classification verdict — CV F1 is the honest number
-        if cv_results["clf_cv_f1"].mean() < 0.40:
-            log.info("  → Classifier CV F1 is LOW ({:.3f} ± {:.3f}).".format(
-                cv_results["clf_cv_f1"].mean(), cv_results["clf_cv_f1"].std()))
-            log.info("    Val F1 ({:.3f}) is misleadingly high — val set is too small to trust.".format(
-                val_clf_score))
-            log.info("    Chrono-CV AUC ({:.3f}) is the only reliable classifier metric.".format(
-                cv_results["clf_cv_auc"].mean()))
-            log.info("    Action: Phase 2 — more data and leave-one-race-out CV required.")
-        elif cv_results["clf_cv_f1"].mean() < 0.60:
-            log.info("  → Classifier CV F1 is MODERATE ({:.3f}). Directional predictions".format(
-                cv_results["clf_cv_f1"].mean()))
-            log.info("    are meaningful but not reliable for production use.")
-        else:
-            log.info("  → Classifier CV F1 is ACCEPTABLE ({:.3f}).".format(
-                cv_results["clf_cv_f1"].mean()))
-
-        log.info("\n  HONEST VERDICT:")
-        log.info("    Regression: CV MAE={:.3f}s (val MAE={:.3f}s — val is NOT representative)".format(
-            cv_results["reg_cv_mae"].mean(), val_reg_score))
-        log.info("    Classifier: CV F1={:.3f} | CV AUC={:.3f} (val F1={:.3f} — NOT representative)".format(
-            cv_results["clf_cv_f1"].mean(), cv_results["clf_cv_auc"].mean(), val_clf_score))
-        log.info("    Phase 1 establishes methodology. Results are directionally valid,")
-        log.info("    not statistically robust. Phase 2 required for production claims.")
-
-
-    except Exception as e:
-        raise CustomException(e, sys)
-
-
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-
+'''
 def run_validation():
     try:
         log.info("=" * 60)
-        log.info("Starting model validation")
+        log.info("Starting model validation — Phase 2")
         log.info("=" * 60)
 
-        train, val, regressor, classifier = load_data_and_models()
+        (train, val, test,
+         sc_train, sc_val, sc_test,
+         reg, clf, reg_sc, clf_sc) = load_all()
+        
+        # Load unscaled features for raw LapNumber (trace plot)
+        features_raw    = pd.read_csv(FEATURES_PATH)
+        features_sc_raw = pd.read_csv(FEATURES_SAME_COMPOUND_PATH)
+        test_raw    = features_raw[features_raw["Race"] == "AbuDhabi"].copy()
+        sc_test_raw = features_sc_raw[features_sc_raw["Race"] == "AbuDhabi"].copy()
 
-        X_train = train[FEATURE_COLS].values
-        X_val   = val[FEATURE_COLS].values
-        y_train_reg = train[TARGET_REGRESSION].values
-        y_val_reg   = val[TARGET_REGRESSION].values
-        y_train_clf = train[TARGET_CLASSIFICATION].values
-        y_val_clf   = val[TARGET_CLASSIFICATION].values
+        fc      = get_feature_cols(train)
+        fc_sc   = get_feature_cols(sc_train)
 
-        # Section 1 — Train vs Val gap
-        train_reg_score, val_reg_score, reg_gap = check_train_val_gap(
-            regressor, X_train, y_train_reg, X_val, y_val_reg,
-            task="regression", metric_fn=mean_absolute_error, metric_name="MAE"
-        )
-        train_clf_score, val_clf_score, clf_gap = check_train_val_gap(
-            classifier, X_train, y_train_clf, X_val, y_val_clf,
-            task="classification", metric_fn=f1_score, metric_name="F1"
-        )
+        # ── Prepare arrays ────────────────────────────────────
+        X_tr,  y_tr_r,  y_tr_c  = train[fc].values,    train[TARGET_REGRESSION].values,    train[TARGET_CLASSIFICATION].values
+        X_val, y_val_r, y_val_c = val[fc].values,       val[TARGET_REGRESSION].values,       val[TARGET_CLASSIFICATION].values
+        X_te,  y_te_r,  y_te_c  = test[fc].values,      test[TARGET_REGRESSION].values,      test[TARGET_CLASSIFICATION].values
 
-        # Section 2 — Cross validation
-        cv_results = cross_validate_models(
-            regressor, classifier, X_train, y_train_reg, y_train_clf, train
-        )
-            
+        X_sc_tr,  y_sc_tr_r,  y_sc_tr_c  = sc_train[fc_sc].values, sc_train[TARGET_REGRESSION].values, sc_train[TARGET_CLASSIFICATION].values
+        X_sc_val, y_sc_val_r, y_sc_val_c = sc_val[fc_sc].values,   sc_val[TARGET_REGRESSION].values,   sc_val[TARGET_CLASSIFICATION].values
+        X_sc_te,  y_sc_te_r,  y_sc_te_c  = sc_test[fc_sc].values,  sc_test[TARGET_REGRESSION].values,  sc_test[TARGET_CLASSIFICATION].values
 
-        # Section 3 — Detailed val diagnostics
-        val_with_pred = detailed_val_diagnostics(
-            regressor, classifier,
-            X_val, y_val_reg, y_val_clf, val
-        )
+        # ─────────────────────────────────────────────────────
+        # REGRESSION VALIDATION
+        # ─────────────────────────────────────────────────────
+        log.info("\n=== REGRESSION — FULL MODEL ===")
+        pred_tr_r,  mae_tr,  r2_tr,  bias_tr  = regression_metrics(reg, X_tr,  y_tr_r,  "Train")
+        pred_val_r, mae_val, r2_val, bias_val  = regression_metrics(reg, X_val, y_val_r, "Val")
+        pred_te_r,  mae_te,  r2_te,  bias_te   = regression_metrics(reg, X_te,  y_te_r,  "TEST")
 
-        # Section 4 — Learning curve
-        curve_results = compute_learning_curve(
-            regressor, X_train, y_train_reg, X_val, y_val_reg
-        )
+        log.info("\n=== REGRESSION — SC MODEL ===")
+        pred_sc_tr_r,  mae_sc_tr,  r2_sc_tr,  _  = regression_metrics(reg_sc, X_sc_tr,  y_sc_tr_r,  "Train")
+        pred_sc_val_r, mae_sc_val, r2_sc_val, _   = regression_metrics(reg_sc, X_sc_val, y_sc_val_r, "Val")
+        pred_sc_te_r,  mae_sc_te,  r2_sc_te,  _   = regression_metrics(reg_sc, X_sc_te,  y_sc_te_r,  "TEST")
 
-        # Section 5 — Final summary and recommendation
-        print_fit_summary(
-            train_reg_score, val_reg_score,
-            train_clf_score, val_clf_score,
-            cv_results
-        )
+        # Overfitting check
+        log.info("\n--- Overfitting check (train − test MAE gap) ---")
+        log.info(f"  Full  : train={mae_tr:.4f}  val={mae_val:.4f}  "
+                 f"test={mae_te:.4f}  gap={mae_te - mae_tr:.4f}s")
+        log.info(f"  SC    : train={mae_sc_tr:.4f}  val={mae_sc_val:.4f}  "
+                 f"test={mae_sc_te:.4f}  gap={mae_sc_te - mae_sc_tr:.4f}s")
 
-        log.info("Model validation complete.")
-        return cv_results, val_with_pred, curve_results
+        # Abu Dhabi note (SC test n=32)
+        log.info(f"\n  NOTE: SC test set = {len(sc_test)} laps (Abu Dhabi SC laps only).")
+        log.info(f"  SC test metrics have wider confidence intervals than full test ({len(test)} laps).")
+
+        # ─────────────────────────────────────────────────────
+        # CLASSIFICATION VALIDATION
+        # ─────────────────────────────────────────────────────
+        log.info("\n=== CLASSIFICATION — FULL MODEL ===")
+        pred_tr_c,  prob_tr_c,  acc_tr,  f1_tr,  auc_tr,  cm_tr   = classification_metrics(clf, X_tr,  y_tr_c,  "Train")
+        pred_val_c, prob_val_c, acc_val, f1_val, auc_val, cm_val   = classification_metrics(clf, X_val, y_val_c, "Val")
+        pred_te_c,  prob_te_c,  acc_te,  f1_te,  auc_te,  cm_te    = classification_metrics(clf, X_te,  y_te_c,  "TEST")
+
+        log.info("\n=== CLASSIFICATION — SC MODEL ===")
+        pred_sc_tr_c,  prob_sc_tr_c,  acc_sc_tr,  f1_sc_tr,  auc_sc_tr,  cm_sc_tr  = classification_metrics(clf_sc, X_sc_tr,  y_sc_tr_c,  "Train")
+        pred_sc_val_c, prob_sc_val_c, acc_sc_val, f1_sc_val, auc_sc_val, cm_sc_val  = classification_metrics(clf_sc, X_sc_val, y_sc_val_c, "Val")
+        pred_sc_te_c,  prob_sc_te_c,  acc_sc_te,  f1_sc_te,  auc_sc_te,  cm_sc_te   = classification_metrics(clf_sc, X_sc_te,  y_sc_te_c,  "TEST")
+
+        # ─────────────────────────────────────────────────────
+        # FINAL RESULTS TABLE
+        # ─────────────────────────────────────────────────────
+        log.info("\n" + "=" * 60)
+        log.info("FINAL HELD-OUT TEST RESULTS — ABU DHABI 2021")
+        log.info("=" * 60)
+        log.info(f"  Full Regression  : MAE={mae_te:.4f}s  R²={r2_te:.4f}  "
+                 f"Bias={bias_te:+.4f}s")
+        log.info(f"  SC   Regression  : MAE={mae_sc_te:.4f}s  R²={r2_sc_te:.4f}  "
+                 f"(n={len(sc_test)})")
+        log.info(f"  Full Classifier  : Acc={acc_te:.4f}  F1={f1_te:.4f}  "
+                 f"AUC={auc_te:.4f}")
+        log.info(f"  SC   Classifier  : Acc={acc_sc_te:.4f}  F1={f1_sc_te:.4f}  "
+                 f"AUC={auc_sc_te:.4f}")
+
+        # ─────────────────────────────────────────────────────
+        # PLOTS
+        # ─────────────────────────────────────────────────────
+        log.info("\nGenerating validation plots...")
+
+        # 1. Pred vs actual — full regression
+        plot_pred_vs_actual([
+            ("Train", y_tr_r,  pred_tr_r,  mae_tr,  r2_tr),
+            ("Val",   y_val_r, pred_val_r, mae_val, r2_val),
+            ("TEST",  y_te_r,  pred_te_r,  mae_te,  r2_te),
+        ], "LGB Regressor (Full)", "reg_full_pred_vs_actual.png")
+
+        # 2. Pred vs actual — SC regression
+        plot_pred_vs_actual([
+            ("Train", y_sc_tr_r,  pred_sc_tr_r,  mae_sc_tr,  r2_sc_tr),
+            ("Val",   y_sc_val_r, pred_sc_val_r, mae_sc_val, r2_sc_val),
+            ("TEST",  y_sc_te_r,  pred_sc_te_r,  mae_sc_te,  r2_sc_te),
+        ], "XGB Regressor (SC)", "reg_sc_pred_vs_actual.png")
+
+        # 3. Residuals by race — train (full model)
+        plot_residuals_by_race(train, pred_tr_r,
+                               "Train", "LGB Regressor (Full)",
+                               "reg_full_residuals_train.png")
+
+        # 4. ROC + PR — full classifier, val and test
+        plot_roc_pr(y_val_c, prob_val_c, "Val",  "LGB Classifier (Full)",
+                    "clf_full_roc_pr_val.png")
+        plot_roc_pr(y_te_c,  prob_te_c,  "TEST", "LGB Classifier (Full)",
+                    "clf_full_roc_pr_test.png")
+
+        # 5. ROC + PR — SC classifier, val and test
+        plot_roc_pr(y_sc_val_c, prob_sc_val_c, "Val",  "XGB Classifier (SC)",
+                    "clf_sc_roc_pr_val.png")
+        plot_roc_pr(y_sc_te_c,  prob_sc_te_c,  "TEST", "XGB Classifier (SC)",
+                    "clf_sc_roc_pr_test.png")
+
+        # 6. Confusion matrices — test set
+        plot_confusion_matrix(cm_te,    "TEST", "LGB Classifier (Full)",
+                              "clf_full_cm_test.png")
+        plot_confusion_matrix(cm_sc_te, "TEST", "XGB Classifier (SC)",
+                              "clf_sc_cm_test.png")
+
+        # 7. Feature importance — all 4 models
+        plot_feature_importance(reg,    fc,    "LGB Regressor (Full)",
+                                "fi_reg_full.png")
+        plot_feature_importance(clf,    fc,    "LGB Classifier (Full)",
+                                "fi_clf_full.png")
+        plot_feature_importance(reg_sc, fc_sc, "XGB Regressor (SC)",
+                                "fi_reg_sc.png")
+        plot_feature_importance(clf_sc, fc_sc, "XGB Classifier (SC)",
+                                "fi_clf_sc.png")
+
+        # 8. MAE summary bar chart
+        plot_metric_summary([
+            ("Train", mae_tr,    mae_sc_tr),
+            ("Val",   mae_val,   mae_sc_val),
+            ("TEST",  mae_te,    mae_sc_te),
+        ], "MAE (s)", "Regression MAE — Train / Val / Test",
+           "summary_mae.png")
+
+        # 9. AUC summary bar chart
+        plot_metric_summary([
+            ("Train", auc_tr,    auc_sc_tr),
+            ("Val",   auc_val,   auc_sc_val),
+            ("TEST",  auc_te,    auc_sc_te),
+        ], "ROC-AUC", "Classification AUC — Train / Val / Test",
+           "summary_auc.png")
+
+        # 10. Abu Dhabi lap-by-lap trace
+        plot_abu_dhabi_trace(test_raw, pred_te_r, pred_sc_te_r,
+                            sc_test_raw, "abu_dhabi_trace.png")
+
+        log.info(f"\nAll plots saved to: {PLOTS_DIR}")
+        log.info("=" * 60)
+        log.info("Validation complete.")
+        log.info("=" * 60)
+
+        return {
+            "reg_full" : {"mae_te": mae_te,    "r2_te": r2_te,    "bias_te": bias_te},
+            "reg_sc"   : {"mae_te": mae_sc_te, "r2_te": r2_sc_te},
+            "clf_full" : {"acc_te": acc_te,    "f1_te": f1_te,    "auc_te": auc_te},
+            "clf_sc"   : {"acc_te": acc_sc_te, "f1_te": f1_sc_te, "auc_te": auc_sc_te},
+        }
 
     except Exception as e:
         raise CustomException(e, sys)
 
 
 if __name__ == "__main__":
-    cv_results, val_with_pred, curve_results = run_validation()
+    results = run_validation()
 
-    print("\n--- LEARNING CURVE TABLE ---")
-    print(f"{'N Samples':>10} {'Train MAE':>12} {'Val MAE':>10} {'Gap':>8}")
-    print("-" * 44)
-    for row in curve_results:
-        print(f"{row['n_samples']:>10} {row['train_mae']:>12.4f} "
-              f"{row['val_mae']:>10.4f} {row['gap']:>8.4f}")
+    log.info("\n" + "=" * 60)
+    log.info("HELD-OUT TEST SUMMARY — ABU DHABI 2021")
+    log.info("=" * 60)
+    log.info(f"\nRegression (Full)  MAE : {results['reg_full']['mae_te']:.4f}s")
+    log.info(f"Regression (Full)  R²  : {results['reg_full']['r2_te']:.4f}")
+    log.info(f"Regression (Full)  Bias: {results['reg_full']['bias_te']:+.4f}s")
+    log.info(f"\nRegression (SC)    MAE : {results['reg_sc']['mae_te']:.4f}s")
+    log.info(f"Regression (SC)    R²  : {results['reg_sc']['r2_te']:.4f}")
+    log.info(f"\nClassifier (Full)  Acc : {results['clf_full']['acc_te']:.4f}")
+    log.info(f"Classifier (Full)  F1  : {results['clf_full']['f1_te']:.4f}")
+    log.info(f"Classifier (Full)  AUC : {results['clf_full']['auc_te']:.4f}")
+    log.info(f"\nClassifier (SC)    Acc : {results['clf_sc']['acc_te']:.4f}")
+    log.info(f"Classifier (SC)    F1  : {results['clf_sc']['f1_te']:.4f}")
+    log.info(f"Classifier (SC)    AUC : {results['clf_sc']['auc_te']:.4f}")
+'''
 
-    print("\n--- CV SUMMARY ---")
-    print(f"Regressor  CV MAE : "
-          f"{cv_results['reg_cv_mae'].mean():.4f} ± {cv_results['reg_cv_mae'].std():.4f}")
-    print(f"Classifier CV F1  : "
-          f"{cv_results['clf_cv_f1'].mean():.4f} ± {cv_results['clf_cv_f1'].std():.4f}")
-    print(f"Classifier CV AUC : "
-          f"{cv_results['clf_cv_auc'].mean():.4f} ± {cv_results['clf_cv_auc'].std():.4f}")
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+def run_validation():
+    try:
+        log.info("=" * 60)
+        log.info("Starting model validation — Phase 2")
+        log.info("=" * 60)
+
+        (train, val, test,
+         sc_train, sc_val, sc_test,
+         reg, clf, reg_sc, clf_sc) = load_all()
+        
+        # Load unscaled features for raw LapNumber (trace plot)
+        features_raw    = pd.read_csv(FEATURES_PATH)
+        features_sc_raw = pd.read_csv(FEATURES_SAME_COMPOUND_PATH)
+        test_raw    = features_raw[features_raw["Race"] == "AbuDhabi"].copy()
+        sc_test_raw = features_sc_raw[features_sc_raw["Race"] == "AbuDhabi"].copy()
+
+        fc      = get_feature_cols(train)
+        fc_sc   = get_feature_cols(sc_train)
+
+        # ── Prepare arrays ────────────────────────────────────
+        X_tr,  y_tr_r,  y_tr_c  = train[fc].values,    train[TARGET_REGRESSION].values,    train[TARGET_CLASSIFICATION].values
+        X_val, y_val_r, y_val_c = val[fc].values,       val[TARGET_REGRESSION].values,       val[TARGET_CLASSIFICATION].values
+        X_te,  y_te_r,  y_te_c  = test[fc].values,      test[TARGET_REGRESSION].values,      test[TARGET_CLASSIFICATION].values
+
+        X_sc_tr,  y_sc_tr_r,  y_sc_tr_c  = sc_train[fc_sc].values, sc_train[TARGET_REGRESSION].values, sc_train[TARGET_CLASSIFICATION].values
+        X_sc_val, y_sc_val_r, y_sc_val_c = sc_val[fc_sc].values,   sc_val[TARGET_REGRESSION].values,   sc_val[TARGET_CLASSIFICATION].values
+        X_sc_te,  y_sc_te_r,  y_sc_te_c  = sc_test[fc_sc].values,  sc_test[TARGET_REGRESSION].values,  sc_test[TARGET_CLASSIFICATION].values
+
+        # ─────────────────────────────────────────────────────
+        # REGRESSION VALIDATION
+        # ─────────────────────────────────────────────────────
+        log.info("\n=== REGRESSION — FULL MODEL ===")
+        pred_tr_r,  mae_tr,  r2_tr,  bias_tr  = regression_metrics(reg, X_tr,  y_tr_r,  "Train")
+        pred_val_r, mae_val, r2_val, bias_val  = regression_metrics(reg, X_val, y_val_r, "Val")
+        pred_te_r,  mae_te,  r2_te,  bias_te   = regression_metrics(reg, X_te,  y_te_r,  "TEST")
+
+        log.info("\n=== REGRESSION — SC MODEL ===")
+        pred_sc_tr_r,  mae_sc_tr,  r2_sc_tr,  _  = regression_metrics(reg_sc, X_sc_tr,  y_sc_tr_r,  "Train")
+        pred_sc_val_r, mae_sc_val, r2_sc_val, _   = regression_metrics(reg_sc, X_sc_val, y_sc_val_r, "Val")
+        pred_sc_te_r,  mae_sc_te,  r2_sc_te,  _   = regression_metrics(reg_sc, X_sc_te,  y_sc_te_r,  "TEST")
+
+        # Overfitting check
+        log.info("\n--- Overfitting check (train − test MAE gap) ---")
+        log.info(f"  Full  : train={mae_tr:.4f}  val={mae_val:.4f}  "
+                 f"test={mae_te:.4f}  gap={mae_te - mae_tr:.4f}s")
+        log.info(f"  SC    : train={mae_sc_tr:.4f}  val={mae_sc_val:.4f}  "
+                 f"test={mae_sc_te:.4f}  gap={mae_sc_te - mae_sc_tr:.4f}s")
+
+        # Abu Dhabi note (SC test n=32)
+        log.info(f"\n  NOTE: SC test set = {len(sc_test)} laps (Abu Dhabi SC laps only).")
+        log.info(f"  SC test metrics have wider confidence intervals than full test ({len(test)} laps).")
+
+        # ─────────────────────────────────────────────────────
+        # CLASSIFICATION VALIDATION
+        # ─────────────────────────────────────────────────────
+        log.info("\n=== CLASSIFICATION — FULL MODEL ===")
+        pred_tr_c,  prob_tr_c,  acc_tr,  f1_tr,  auc_tr,  cm_tr   = classification_metrics(clf, X_tr,  y_tr_c,  "Train")
+        pred_val_c, prob_val_c, acc_val, f1_val, auc_val, cm_val   = classification_metrics(clf, X_val, y_val_c, "Val")
+        pred_te_c,  prob_te_c,  acc_te,  f1_te,  auc_te,  cm_te    = classification_metrics(clf, X_te,  y_te_c,  "TEST")
+
+        log.info("\n=== CLASSIFICATION — SC MODEL ===")
+        pred_sc_tr_c,  prob_sc_tr_c,  acc_sc_tr,  f1_sc_tr,  auc_sc_tr,  cm_sc_tr  = classification_metrics(clf_sc, X_sc_tr,  y_sc_tr_c,  "Train")
+        pred_sc_val_c, prob_sc_val_c, acc_sc_val, f1_sc_val, auc_sc_val, cm_sc_val  = classification_metrics(clf_sc, X_sc_val, y_sc_val_c, "Val")
+        pred_sc_te_c,  prob_sc_te_c,  acc_sc_te,  f1_sc_te,  auc_sc_te,  cm_sc_te   = classification_metrics(clf_sc, X_sc_te,  y_sc_te_c,  "TEST")
+
+        # ─────────────────────────────────────────────────────
+        # FINAL RESULTS TABLE
+        # ─────────────────────────────────────────────────────
+        log.info("\n" + "=" * 60)
+        log.info("FINAL HELD-OUT TEST RESULTS — ABU DHABI 2021")
+        log.info("=" * 60)
+        log.info(f"  Full Regression  : MAE={mae_te:.4f}s  R²={r2_te:.4f}  "
+                 f"Bias={bias_te:+.4f}s")
+        log.info(f"  SC   Regression  : MAE={mae_sc_te:.4f}s  R²={r2_sc_te:.4f}  "
+                 f"(n={len(sc_test)})")
+        log.info(f"  Full Classifier  : Acc={acc_te:.4f}  F1={f1_te:.4f}  "
+                 f"AUC={auc_te:.4f}")
+        log.info(f"  SC   Classifier  : Acc={acc_sc_te:.4f}  F1={f1_sc_te:.4f}  "
+                 f"AUC={auc_sc_te:.4f}")
+
+        # ─────────────────────────────────────────────────────
+        # PLOTS
+        # ─────────────────────────────────────────────────────
+        log.info("\nGenerating validation plots...")
+
+        # 10. Abu Dhabi lap-by-lap trace
+        plot_abu_dhabi_trace(test_raw, pred_te_r, pred_sc_te_r,
+                            sc_test_raw, "abu_dhabi_trace.png")
+
+        log.info(f"\nAll plots saved to: {PLOTS_DIR}")
+        log.info("=" * 60)
+        log.info("Validation complete.")
+        log.info("=" * 60)
+
+        return {
+            "reg_full" : {"mae_te": mae_te,    "r2_te": r2_te,    "bias_te": bias_te},
+            "reg_sc"   : {"mae_te": mae_sc_te, "r2_te": r2_sc_te},
+            "clf_full" : {"acc_te": acc_te,    "f1_te": f1_te,    "auc_te": auc_te},
+            "clf_sc"   : {"acc_te": acc_sc_te, "f1_te": f1_sc_te, "auc_te": auc_sc_te},
+        }
+
+    except Exception as e:
+        raise CustomException(e, sys)
+
+
+if __name__ == "__main__":
+    results = run_validation()
+
+    log.info("\n" + "=" * 60)
+    log.info("HELD-OUT TEST SUMMARY — ABU DHABI 2021")
+    log.info("=" * 60)
+    log.info(f"\nRegression (Full)  MAE : {results['reg_full']['mae_te']:.4f}s")
+    log.info(f"Regression (Full)  R²  : {results['reg_full']['r2_te']:.4f}")
+    log.info(f"Regression (Full)  Bias: {results['reg_full']['bias_te']:+.4f}s")
+    log.info(f"\nRegression (SC)    MAE : {results['reg_sc']['mae_te']:.4f}s")
+    log.info(f"Regression (SC)    R²  : {results['reg_sc']['r2_te']:.4f}")
+    log.info(f"\nClassifier (Full)  Acc : {results['clf_full']['acc_te']:.4f}")
+    log.info(f"Classifier (Full)  F1  : {results['clf_full']['f1_te']:.4f}")
+    log.info(f"Classifier (Full)  AUC : {results['clf_full']['auc_te']:.4f}")
+    log.info(f"\nClassifier (SC)    Acc : {results['clf_sc']['acc_te']:.4f}")
+    log.info(f"Classifier (SC)    F1  : {results['clf_sc']['f1_te']:.4f}")
+    log.info(f"Classifier (SC)    AUC : {results['clf_sc']['auc_te']:.4f}")
